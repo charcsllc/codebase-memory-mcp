@@ -2276,7 +2276,30 @@ static bool is_test_file(const char *path) {
 static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_result_t *tr,
                                          bool risk_labels, bool include_tests) {
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    /* The BFS CTE keeps one row per (node, hop) pair, so a node reachable
+     * through paths of different lengths repeats. Rows arrive ordered by
+     * hop ascending: keeping the first occurrence keeps the minimum hop.
+     * (Dedup here, not in the SQL — Cypher var-length *m..n patterns need
+     * the per-hop rows.) */
+    int64_t *seen = tr->visited_count > 0
+                        ? malloc(sizeof(int64_t) * (size_t)tr->visited_count)
+                        : NULL;
+    int seen_count = 0;
     for (int i = 0; i < tr->visited_count; i++) {
+        int64_t nid = tr->visited[i].node.id;
+        bool dup = false;
+        for (int s = 0; s < seen_count; s++) {
+            if (seen[s] == nid) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        if (seen) {
+            seen[seen_count++] = nid;
+        }
         const char *fp = tr->visited[i].node.file_path;
         bool test = is_test_file(fp);
         if (!include_tests && test) {
@@ -2298,6 +2321,7 @@ static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_resul
         }
         yyjson_mut_arr_add_val(arr, item);
     }
+    free(seen);
     return arr;
 }
 
@@ -3389,26 +3413,36 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
                 tmpfile, filelist, sm);
         }
     } else {
+        /* Mirror the POSIX sensitive-file exclusions (see below): the
+         * recursive fallback bypasses the discovery-time filter. */
+        const char *psx = "-Exclude '.env','.env.*','*.pem','*.key','id_rsa*','id_ed25519*',"
+                          "'credentials*','*service_account*.json' ";
         if (file_pattern) {
             snprintf(
                 cmd, cmd_sz,
-                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' -File "
+                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' %s-File "
                 "-ErrorAction SilentlyContinue"
                 " | Select-String -Pattern (Get-Content '%s')%s -ErrorAction SilentlyContinue"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, file_pattern, tmpfile, sm);
+                root_path, file_pattern, psx, tmpfile, sm);
         } else {
             snprintf(
                 cmd, cmd_sz,
-                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -File -ErrorAction "
+                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' %s-File -ErrorAction "
                 "SilentlyContinue"
                 " | Select-String -Pattern (Get-Content '%s')%s -ErrorAction SilentlyContinue"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, tmpfile, sm);
+                root_path, psx, tmpfile, sm);
         }
     }
 #else
     const char *flag = use_regex ? "-E" : "-F";
+    /* The recursive fallback bypasses the indexed file list (which already
+     * excludes sensitive files at discovery), so it must blind itself to
+     * secret-bearing files explicitly. Mirrors discover.c's sensitive set. */
+    const char *sens = " --exclude='.env' --exclude='.env.*' --exclude='*.pem' --exclude='*.key'"
+                       " --exclude='id_rsa*' --exclude='id_ed25519*' --exclude='credentials*'"
+                       " --exclude='*service_account*.json'";
     if (scoped) {
         if (file_pattern) {
             snprintf(cmd, cmd_sz, "xargs grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
@@ -3419,10 +3453,11 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
         }
     } else {
         if (file_pattern) {
-            snprintf(cmd, cmd_sz, "grep -rn %s --include='%s' -f '%s' '%s' 2>/dev/null", flag,
-                     file_pattern, tmpfile, root_path);
+            snprintf(cmd, cmd_sz, "grep -rn %s --include='%s'%s -f '%s' '%s' 2>/dev/null", flag,
+                     file_pattern, sens, tmpfile, root_path);
         } else {
-            snprintf(cmd, cmd_sz, "grep -rn %s -f '%s' '%s' 2>/dev/null", flag, tmpfile, root_path);
+            snprintf(cmd, cmd_sz, "grep -rn %s%s -f '%s' '%s' 2>/dev/null", flag, sens, tmpfile,
+                     root_path);
         }
     }
 #endif
@@ -4114,7 +4149,11 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     classify_all_grep_hits(gm, gm_count, store, project, &sr, &sr_count, &sr_cap, &raw, &raw_count,
                            &raw_cap);
 
-    /* Phase 3: batch degree query — ONE query for all results instead of 2×N */
+    /* Phase 3: batch degree query — ONE query for all results instead of 2×N.
+     * Deliberately CALLS-only: this feeds search_code's relevance ranking,
+     * where pure code centrality is the signal. Graph-wide degrees (incl.
+     * HTTP_CALLS/HANDLES/INFRA_MAPS) live in cbm_store_search /
+     * cbm_store_node_degree instead. */
     if (store && sr_count > 0) {
         int64_t *ids = malloc(sr_count * sizeof(int64_t));
         int *in_degs = malloc(sr_count * sizeof(int));

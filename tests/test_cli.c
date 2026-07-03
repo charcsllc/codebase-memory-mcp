@@ -1067,6 +1067,36 @@ TEST(cli_install_copies_binary_to_target_issue472) {
     PASS();
 }
 
+/* Upgrading over a BUSY target must unlink-then-copy: fopen("wb") on the
+ * existing file fails with ETXTBSY when it is the running server binary
+ * (the common upgrade path — `install --force` while the MCP server is up
+ * printed "error: failed to copy binary") and with EACCES when it is
+ * read-only; unlink succeeds in both cases on Unix because the running
+ * process keeps its inode. Read-only reproduces the failure class portably. */
+TEST(cli_install_replaces_busy_binary) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-busybin-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char src[512], dst[512];
+    snprintf(src, sizeof(src), "%s/new-build", tmpdir);
+    snprintf(dst, sizeof(dst), "%s/installed", tmpdir);
+    write_test_file(src, "upgraded build bytes");
+    write_test_file(dst, "RUNNING OLD BINARY");
+#ifndef _WIN32
+    chmod(dst, 0555); /* not writable in place — like a busy executable */
+#endif
+
+    int rc = cbm_copy_binary_to_target(src, dst);
+    ASSERT_EQ(rc, 0);
+    const char *data = read_test_file(dst);
+    ASSERT_STR_EQ(data, "upgraded build bytes");
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* #472: copying the running binary onto itself must NOT truncate it. */
 TEST(cli_install_same_file_guard_issue472) {
     char tmpdir[256];
@@ -2732,6 +2762,7 @@ SUITE(cli) {
 
     /* Binary swap on install --force (#472) */
     RUN_TEST(cli_install_copies_binary_to_target_issue472);
+    RUN_TEST(cli_install_replaces_busy_binary);
     RUN_TEST(cli_install_same_file_guard_issue472);
 
     /* YAML parser (7 unit tests) */

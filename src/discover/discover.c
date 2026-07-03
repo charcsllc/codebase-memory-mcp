@@ -75,6 +75,43 @@ static const char *FAST_IGNORED_SUFFIXES[] = {
     ".crt", ".key",  ".cer",      ".p12",  ".pb",  ".avro",   ".parquet", ".beam",
     ".elc", ".rlib", ".coverage", ".prof", ".out", ".patch",  ".diff",    NULL};
 
+/* ── Sensitive files (excluded in every mode) ───────── */
+
+/* Secret-bearing files are excluded from discovery regardless of index mode —
+ * even when git-tracked — so the graph, code snippets and search_code never
+ * expose their contents. Templates (.env.example/.env.sample) stay indexable.
+ * A `!pattern` in .cbmignore re-includes a file explicitly (the check runs
+ * after the cbmignore negation in should_skip_file). Criterion mirrors
+ * pass_envscan's is_secret_file. */
+static const char *SENSITIVE_SUFFIXES[] = {".pem", ".key", NULL};
+static const char *SENSITIVE_PREFIXES[] = {"id_rsa", "id_ed25519", "credentials", NULL};
+
+static bool ends_with(const char *s, const char *suffix);
+
+static bool is_sensitive_filename(const char *filename) {
+    if (!filename) {
+        return false;
+    }
+    if (strncmp(filename, ".env", strlen(".env")) == 0 &&
+        (filename[strlen(".env")] == '\0' || filename[strlen(".env")] == '.')) {
+        return strcmp(filename, ".env.example") != 0 && strcmp(filename, ".env.sample") != 0;
+    }
+    for (int i = 0; SENSITIVE_SUFFIXES[i]; i++) {
+        if (ends_with(filename, SENSITIVE_SUFFIXES[i])) {
+            return true;
+        }
+    }
+    for (int i = 0; SENSITIVE_PREFIXES[i]; i++) {
+        if (strncmp(filename, SENSITIVE_PREFIXES[i], strlen(SENSITIVE_PREFIXES[i])) == 0) {
+            return true;
+        }
+    }
+    if (strstr(filename, "service_account") != NULL && ends_with(filename, ".json")) {
+        return true;
+    }
+    return false;
+}
+
 /* ── Fast-mode skip filenames ─────────────────────── */
 
 static const char *FAST_SKIP_FILENAMES[] = {
@@ -530,14 +567,21 @@ static bool should_skip_file(const char *entry_name, const char *rel_path,
             return true;
         }
     }
+    /* Sensitive defaults are decided AFTER the cbmignore negation so a
+     * `!.env` line can re-include a secret-bearing file explicitly. */
+    bool sensitive = is_sensitive_filename(entry_name);
     if (cbmignore) {
         int cbm_result = cbm_gitignore_match_result(cbmignore, rel_path, false);
         if (cbm_result > 0) {
             return true;
         }
-        if (cbm_result < 0 && global_ignored) {
+        if (cbm_result < 0) {
             global_ignored = false;
+            sensitive = false;
         }
+    }
+    if (sensitive) {
+        return true;
     }
     if (opts && opts->max_file_size > 0 && file_size > opts->max_file_size) {
         return true;

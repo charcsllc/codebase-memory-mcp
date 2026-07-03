@@ -1171,7 +1171,10 @@ static const char *find_route_path_in_args(const CBMCall *call, const char **out
     if (!found) {
         return NULL;
     }
-    /* 3. Handler: first identifier arg that's not a path/keyword */
+    /* 3. Handler: last identifier-shaped arg that's not a path/keyword.
+     * Mirrors extract_handler_arg's last-wins rule so a leading options
+     * object or middleware reference does not shadow the real handler;
+     * inline function/object literals are rejected by shape. */
     for (int ai = 0; ai < call->arg_count; ai++) {
         const CBMCallArg *ca = &call->args[ai];
         if (!ca->expr || ca->expr[0] == '/' || ca->expr[0] == '"' || ca->expr[0] == '\'') {
@@ -1181,8 +1184,17 @@ static const char *find_route_path_in_args(const CBMCall *call, const char **out
                             strcmp(ca->keyword, "name") == 0 || strcmp(ca->keyword, "tags") == 0)) {
             continue;
         }
-        *out_handler = ca->expr;
-        break;
+        bool is_ref = (ca->expr[0] == '_' || ca->expr[0] == '$' ||
+                       (ca->expr[0] >= 'a' && ca->expr[0] <= 'z') ||
+                       (ca->expr[0] >= 'A' && ca->expr[0] <= 'Z'));
+        for (const char *p = ca->expr; is_ref && *p; p++) {
+            if (*p == '(' || *p == '{' || *p == '[' || *p == '=' || *p == ' ' || *p == '\n') {
+                is_ref = false;
+            }
+        }
+        if (is_ref) {
+            *out_handler = ca->expr;
+        }
     }
     return found;
 }
@@ -1324,87 +1336,6 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
                 cbm_gbuf_insert_edge(gbuf, h->id, rid, "HANDLES", hp);
             }
         }
-    }
-}
-
-/* Reject regex metacharacters, spaces, double-slashes in URL candidates. */
-static bool is_junk_url(const char *s) {
-    for (int i = 0; s[i]; i++) {
-        char ch = s[i];
-        if (ch == '\\' || ch == '^' || ch == '$' || ch == '*' || ch == '+' || ch == '(' ||
-            ch == ')' || ch == '[' || ch == ']' || ch == '|' || ch == ' ') {
-            return true;
-        }
-        if (ch == '/' && i > 0 && s[i - SKIP_ONE] == '/') {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* Normalize a template literal URL and reject junk patterns.
- * Returns true if norm contains a valid API path. */
-static bool normalize_url_arg(const char *url, char *norm, int norm_sz) {
-    int ni = 0;
-    const char *p = url;
-    if (*p == '`' || *p == '"' || *p == '\'') {
-        p++;
-    }
-    if (*p != '/') {
-        return false;
-    }
-    while (*p && ni < norm_sz - PAIR_LEN) {
-        if (*p == '$' && *(p + SKIP_ONE) == '{') {
-            norm[ni++] = ':';
-            p += PAIR_LEN;
-            while (*p && *p != '}' && ni < norm_sz - PAIR_LEN) {
-                norm[ni++] = *p++;
-            }
-            if (*p == '}') {
-                p++;
-            }
-        } else if (*p == '`' || *p == '"' || *p == '\'' || *p == '?') {
-            break;
-        } else {
-            norm[ni++] = *p++;
-        }
-    }
-    norm[ni] = '\0';
-    enum { MIN_URL_LEN = 4 };
-    if (ni < MIN_URL_LEN || !strchr(norm + SKIP_ONE, '/')) {
-        return false;
-    }
-    return !is_junk_url(norm);
-}
-
-/* Detect API paths in call arguments and create HTTP_CALLS edges. */
-static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
-                               const CBMCall *call) {
-    for (int ai = 0; ai < call->arg_count; ai++) {
-        const CBMCallArg *ca = &call->args[ai];
-        const char *url = ca->value ? ca->value : ca->expr;
-        if (!url || (url[0] != '/' && url[0] != '`')) {
-            continue;
-        }
-        char norm[CBM_SZ_256];
-        if (!normalize_url_arg(url, norm, (int)sizeof(norm))) {
-            continue;
-        }
-        char route_qn[CBM_ROUTE_QN_SIZE];
-        char cpath[CBM_SZ_256];
-        snprintf(route_qn, sizeof(route_qn), "__route__ANY__%s",
-                 cbm_route_canon_path(norm, cpath, sizeof(cpath)));
-        int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", norm, route_qn, "", 0, 0,
-                                                "{\"source\":\"arg_url\"}");
-        char esc_c[CBM_SZ_256];
-        char esc_n[CBM_SZ_256];
-        cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
-        cbm_json_escape(esc_n, sizeof(esc_n), norm);
-        char eprops[CBM_SZ_512];
-        snprintf(eprops, sizeof(eprops),
-                 "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\"}", esc_c, esc_n);
-        cbm_gbuf_insert_edge(gbuf, source->id, route_id, "HTTP_CALLS", eprops);
-        break;
     }
 }
 
@@ -1631,12 +1562,19 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
     } else if (svc == CBM_SVC_TRPC) {
         emit_trpc_edge(gbuf, source, call, res);
     } else if (svc == CBM_SVC_CONFIG) {
-        emit_config_edge(gbuf, source, target, call, res, arg);
-    } else {
+        if (source->id != target->id) {
+            emit_config_edge(gbuf, source, target, call, res, arg);
+        }
+    } else if (source->id != target->id) {
+        /* The unresolved callee_suffix caller passes source as target; when a
+         * route-registration suffix match carries no '/path' (Map.get, redis
+         * .get, cookies().get, ...) the fall-through must not fabricate a
+         * self CALLS edge — resolved self-calls are already dropped by the
+         * caller, so a self pair here is always synthetic. */
         emit_normal_calls_edge(gbuf, source, target, call, res);
     }
 
-    detect_url_in_args(gbuf, source, call);
+    cbm_pipeline_detect_url_in_args(gbuf, source, call);
 }
 
 /* Find the source node for an edge: enclosing function or file node. */
@@ -1841,7 +1779,41 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
 
+        /* JS/TS mirror of the Perl guard: an unresolved-receiver call to a
+         * generic prototype method (Map.get, Set.add, redis.set, ...) must
+         * not be wired to a project function sharing the name via a weak
+         * project-global strategy. High-confidence strategies (same_module,
+         * import_map*, qualified_suffix, field_type_hint, lsp_*) pass through
+         * — see cbm_js_suppress_generic_match. */
+        bool lang_is_js = (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+                           lang == CBM_LANG_JAVASCRIPT);
+        /* A resolved QN matching a service pattern (bullmq queue.add, sqs
+         * SendMessage, ...) is a strong signal the receiver guess is right —
+         * it classifies as ASYNC/HTTP_CALLS, not a noisy plain CALLS. */
+        bool svc_qn = res.qualified_name && res.qualified_name[0] &&
+                      cbm_service_pattern_match(res.qualified_name) != CBM_SVC_NONE;
+        if (!svc_qn && cbm_js_suppress_generic_match(lang_is_js, call->is_method,
+                                                     call->callee_name, res.strategy)) {
+            continue;
+        }
+
+        /* Invoking a callback PARAMETER of the enclosing function (detected
+         * at extraction — is_param_call) can never be a cross-file call to a
+         * project function sharing the name: drop weak short-name guesses. */
+        if (lang_is_js && call->is_param_call && res.strategy &&
+            (strcmp(res.strategy, "unique_name") == 0 ||
+             strcmp(res.strategy, "suffix_match") == 0)) {
+            continue;
+        }
+
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
+            /* Direct global fetch(): a browser/Node builtin that never
+             * resolves to a project symbol. Emit the HTTP_CALLS edge here —
+             * detect_url_in_args only runs for resolved callees. */
+            if (lang_is_js && cbm_pipeline_is_global_fetch(call->callee_name)) {
+                cbm_pipeline_emit_global_fetch_edge(ws->local_edge_buf, source_node, call);
+                continue;
+            }
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,

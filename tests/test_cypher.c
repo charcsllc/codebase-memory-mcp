@@ -2523,6 +2523,77 @@ TEST(cypher_multi_prop_projection_no_alias) {
 
 /* ══════════════════════════════════════════════════════════════════ */
 
+/* ── D9a: path / line_number aliases ─────────────────────────────── */
+
+/* `f.path` and `f.line_number` must alias the real node properties
+ * (file_path / start_line) instead of silently returning "". */
+TEST(cypher_exec_path_and_line_aliases) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WHERE f.name = \"HandleOrder\" "
+                                "RETURN f.path, f.line_number, f.line",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_EQ(r.col_count, 3);
+    ASSERT_STR_EQ(r.rows[0][0], "handler.go");
+    ASSERT_STR_EQ(r.rows[0][1], "10");
+    ASSERT_STR_EQ(r.rows[0][2], "10");
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── M3: repeated variable must constrain the match ──────────────── */
+
+/* MATCH (x)-[:CALLS]->(x) must only match self-loops, not every edge. */
+TEST(cypher_exec_repeated_variable_self_loop_only) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "loop", "/tmp/loop");
+    cbm_node_t a = {.project = "loop",
+                    .label = "Function",
+                    .name = "alpha",
+                    .qualified_name = "loop.alpha",
+                    .file_path = "a.go"};
+    cbm_node_t b = {.project = "loop",
+                    .label = "Function",
+                    .name = "bravo",
+                    .qualified_name = "loop.bravo",
+                    .file_path = "b.go"};
+    cbm_node_t c = {.project = "loop",
+                    .label = "Function",
+                    .name = "charlie",
+                    .qualified_name = "loop.charlie",
+                    .file_path = "c.go"};
+    int64_t ida = cbm_store_upsert_node(s, &a);
+    int64_t idb = cbm_store_upsert_node(s, &b);
+    int64_t idc = cbm_store_upsert_node(s, &c);
+    cbm_edge_t e1 = {.project = "loop", .source_id = ida, .target_id = idb, .type = "CALLS"};
+    cbm_edge_t e2 = {.project = "loop", .source_id = idc, .target_id = idc, .type = "CALLS"};
+    cbm_store_insert_edge(s, &e1);
+    cbm_store_insert_edge(s, &e2);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (x)-[:CALLS]->(x) RETURN x.name", "loop", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "charlie");
+    cbm_cypher_result_free(&r);
+
+    /* Control: distinct variables still see every edge. */
+    cbm_cypher_result_t r2 = {0};
+    rc = cbm_cypher_execute(s, "MATCH (x)-[:CALLS]->(y) RETURN x.name", "loop", 0, &r2);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r2.row_count, 2);
+    cbm_cypher_result_free(&r2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(cypher) {
     /* Lexer */
     RUN_TEST(cypher_lex_simple_match);
@@ -2554,6 +2625,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_error);
     /* Execution */
     RUN_TEST(cypher_exec_match_all_functions);
+    RUN_TEST(cypher_exec_path_and_line_aliases);
+    RUN_TEST(cypher_exec_repeated_variable_self_loop_only);
     RUN_TEST(cypher_issue240_labels_function);
     RUN_TEST(cypher_issue237_distinct_order_limit);
     RUN_TEST(cypher_issue252_tointeger);

@@ -120,6 +120,108 @@ TEST(extract_ts_factory_object_methods_issue341) {
     PASS();
 }
 
+/* --- TS: `await f<T>(...)` with explicit type arguments keeps the call --- */
+/* With explicit generics the call parses as call_expression(function:
+ * await_expression(identifier), type_arguments, arguments); the callee must
+ * be unwrapped from the await_expression, not dropped. */
+TEST(extract_ts_await_generic_call) {
+    CBMFileResult *r = extract("export async function listAdminCategories() {\n"
+                               "  const rows = await authedGet<Row[]>('/api/admin/categories')\n"
+                               "  return rows\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "admin.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call(r, "authedGet"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Controls: the same call without generics and without await must keep
+ * extracting (regression guard for the unwrap). */
+TEST(extract_ts_await_generic_call_controls) {
+    CBMFileResult *r = extract("export async function a() { return await g('/x') }\n"
+                               "export function b() { return g<T>('/x') }\n"
+                               "export function c() { return (g)('/x') }\n",
+                               CBM_LANG_TYPESCRIPT, "t", "ctrl.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int g_calls = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (strcmp(r->calls.items[i].callee_name, "g") == 0) {
+            g_calls++;
+        }
+    }
+    ASSERT_GTE(g_calls, 3);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* --- TS: template-literal URLs populate first_string_arg --- */
+/* URL-position template literals (route registrations, HTTP clients) must
+ * strip backticks and keep ${...} markers so downstream canonicalization
+ * collapses them; non-URL templates stay out of first_string_arg. */
+TEST(extract_ts_template_url_first_string_arg) {
+    CBMFileResult *r = extract("export function reg(app: any, h: any) {\n"
+                               "  app.get(`/tpl`, h)\n"
+                               "}\n"
+                               "export async function z(id: string) {\n"
+                               "  return axios.get(`/api/z/${id}`)\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "client.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int checked = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "app.get") == 0) {
+            ASSERT_NOT_NULL(c->first_string_arg);
+            ASSERT_STR_EQ(c->first_string_arg, "/tpl");
+            ASSERT_NOT_NULL(c->second_arg_name);
+            ASSERT_STR_EQ(c->second_arg_name, "h");
+            checked++;
+        }
+        if (strcmp(c->callee_name, "axios.get") == 0) {
+            ASSERT_NOT_NULL(c->first_string_arg);
+            ASSERT_STR_EQ(c->first_string_arg, "/api/z/${id}");
+            checked++;
+        }
+    }
+    ASSERT_EQ(checked, 2);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* --- Prisma: models labeled Model; generator/datasource are not defs --- */
+TEST(extract_prisma_model_labels) {
+    CBMFileResult *r = extract("generator client {\n"
+                               "  provider = \"prisma-client-js\"\n"
+                               "}\n"
+                               "datasource db {\n"
+                               "  provider = \"postgresql\"\n"
+                               "  url      = env(\"DATABASE_URL\")\n"
+                               "}\n"
+                               "model User {\n"
+                               "  id    String @id\n"
+                               "  email String @unique\n"
+                               "}\n"
+                               "enum Role {\n"
+                               "  USER\n"
+                               "  ADMIN\n"
+                               "}\n",
+                               CBM_LANG_PRISMA, "t", "schema.prisma");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_defs_with_label(r, "Model"), 1);
+    ASSERT(has_def(r, "Model", "User"));
+    ASSERT_EQ(count_defs_with_label(r, "Class"), 0);
+    /* generator/datasource blocks are connection config, not domain types. */
+    ASSERT(!has_def_any(r, "client"));
+    ASSERT(!has_def_any(r, "db"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- C/C++ preprocessor macros become Macro nodes (#375) --- */
 TEST(extract_c_macros_issue375) {
     CBMFileResult *r = extract("#define SIMPLE_MACRO 1\n"
@@ -3003,16 +3105,29 @@ TEST(extract_perl_method_call_flags_is_method) {
     PASS();
 }
 
-/* Other languages must be unaffected: a JS method call never sets is_method
- * (the flag is Perl-only). */
+/* TS/JS receiver calls set is_method (the callee keeps its dotted
+ * receiver); bare calls stay unflagged. Other languages are unaffected. */
 TEST(extract_non_perl_method_call_not_flagged_is_method) {
     CBMFileResult *r =
         extract("function run(o){ o.commit(); helper(); }\n", CBM_LANG_JAVASCRIPT, "t", "x.js");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     for (int i = 0; i < r->calls.count; i++) {
-        ASSERT_FALSE(r->calls.items[i].is_method);
+        if (strcmp(r->calls.items[i].callee_name, "o.commit") == 0) {
+            ASSERT_TRUE(r->calls.items[i].is_method);
+        }
+        if (strcmp(r->calls.items[i].callee_name, "helper") == 0) {
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        }
     }
+    /* Go member calls stay unflagged: the guard is Perl/TS/JS-scoped. */
+    CBMFileResult *g = extract("package main\nfunc run() { obj.Commit() }\n", CBM_LANG_GO, "t",
+                               "x.go");
+    ASSERT_NOT_NULL(g);
+    for (int i = 0; i < g->calls.count; i++) {
+        ASSERT_FALSE(g->calls.items[i].is_method);
+    }
+    cbm_free_result(g);
     cbm_free_result(r);
     PASS();
 }
@@ -3035,6 +3150,10 @@ SUITE(extraction) {
     RUN_TEST(extract_r_box_use_imports_issue218);
     RUN_TEST(extract_r_dollar_call_issue219);
     RUN_TEST(extract_ts_factory_object_methods_issue341);
+    RUN_TEST(extract_ts_await_generic_call);
+    RUN_TEST(extract_ts_await_generic_call_controls);
+    RUN_TEST(extract_prisma_model_labels);
+    RUN_TEST(extract_ts_template_url_first_string_arg);
     RUN_TEST(extract_c_macros_issue375);
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_gdscript_issue186);

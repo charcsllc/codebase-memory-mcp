@@ -685,33 +685,29 @@ TEST(probe_sosl_module_only) {
  * Extension: .env suffix detected by pass_envscan; filename ".env" also works.
  * ══════════════════════════════════════════════════════════════════ */
 
-/* DotEnv: .env file → only Module node. */
+/* DotEnv: .env files carry secrets and are EXCLUDED from discovery by
+ * default in every mode (see is_sensitive_filename, discover.c) — the graph,
+ * snippets and search_code must never expose their contents. Direct
+ * extraction of the DotEnv grammar stays covered by grammar_labels
+ * (dotenv=Module:1); a `!.env` in .cbmignore re-includes the file. */
 TEST(probe_dotenv_module_only) {
     GpgMetrics m = gpg_metrics(".env", "DATABASE_URL=postgres://localhost/mydb\n"
                                        "SECRET_KEY=supersecret\n"
                                        "DEBUG=true\n");
     ASSERT_TRUE(m.ok);
-    /* REAL BUG (NEW class — file-index routing gap): the DotEnv grammar +
-     * histogram (grammar_labels dotenv=Module:1) exist and work via DIRECT
-     * extraction, but ".env" has no FILENAME_TABLE / EXT_TABLE entry in
-     * language.c, so file-based index_repository's cbm_language_for_filename
-     * returns CBM_LANG_COUNT and the file is never indexed → 0 Module nodes.
-     * Routing/registration gap, distinct from extraction classes 2/16.  RED. */
-    ASSERT_TRUE(m.modules == 1); /* REAL BUG — .env not routed by file index */
+    /* Sensitive default exclusion: no nodes from an indexed .env. */
+    ASSERT_TRUE(m.modules == 0);
     ASSERT_TRUE(m.variables == 0);
     PASS();
 }
 
-/* DotEnv: .env.local suffix variant → indexed as DotEnv. */
+/* DotEnv: .env.local is a sensitive variant — also excluded by default
+ * (only .env.example / .env.sample templates stay indexable). */
 TEST(probe_dotenv_local_suffix) {
     GpgMetrics m = gpg_metrics(".env.local", "API_KEY=local-test-key\n"
                                              "PORT=3001\n");
     ASSERT_TRUE(m.ok);
-    /* REAL BUG (NEW class — file-index routing gap): ".env.local" has no
-     * FILENAME_TABLE/EXT_TABLE entry, so file-based index_repository never
-     * routes it to CBM_LANG_DOTENV → 0 Module nodes.  Same routing gap as
-     * probe_dotenv_module_only.  RED. */
-    ASSERT_TRUE(m.modules >= 1); /* REAL BUG — .env.local not routed by file index */
+    ASSERT_TRUE(m.modules == 0);
     PASS();
 }
 

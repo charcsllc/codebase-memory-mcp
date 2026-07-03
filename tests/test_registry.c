@@ -742,6 +742,61 @@ TEST(perl_suppress_keeps_high_confidence_and_genuine_calls) {
     PASS();
 }
 
+/* ── JS/TS generic-method guard (graph accuracy: bare-name noise) ── */
+
+TEST(js_generic_set_recognizes_prototype_methods) {
+    ASSERT_TRUE(cbm_js_is_generic_method("get"));
+    ASSERT_TRUE(cbm_js_is_generic_method("set"));
+    ASSERT_TRUE(cbm_js_is_generic_method("add"));
+    ASSERT_TRUE(cbm_js_is_generic_method("push"));
+    ASSERT_TRUE(cbm_js_is_generic_method("then"));
+    ASSERT_TRUE(cbm_js_is_generic_method("forEach"));
+    ASSERT_TRUE(cbm_js_is_generic_method("resolve"));
+    ASSERT_TRUE(cbm_js_is_generic_method("add"));    /* first element */
+    ASSERT_TRUE(cbm_js_is_generic_method("values")); /* last element */
+    PASS();
+}
+
+TEST(js_generic_set_rejects_project_names) {
+    ASSERT_FALSE(cbm_js_is_generic_method("updateStatusIf"));
+    ASSERT_FALSE(cbm_js_is_generic_method("hashPassword"));
+    ASSERT_FALSE(cbm_js_is_generic_method("run"));
+    ASSERT_FALSE(cbm_js_is_generic_method("Set")); /* case-sensitive */
+    ASSERT_FALSE(cbm_js_is_generic_method(""));
+    ASSERT_FALSE(cbm_js_is_generic_method(NULL));
+    PASS();
+}
+
+TEST(js_suppress_drops_weak_generic_receiver_matches) {
+    /* redis.set / s.add / cookies.get landing via weak project-global
+     * strategies are resolver noise and must be suppressed. */
+    ASSERT_TRUE(cbm_js_suppress_generic_match(true, true, "redis.set", "unique_name"));
+    ASSERT_TRUE(cbm_js_suppress_generic_match(true, true, "s.add", "unique_name"));
+    ASSERT_TRUE(cbm_js_suppress_generic_match(true, true, "cookies.get", "suffix_match"));
+    ASSERT_TRUE(cbm_js_suppress_generic_match(true, true, "path.resolve", "unique_name"));
+    PASS();
+}
+
+TEST(js_suppress_keeps_specific_and_high_confidence_matches) {
+    /* Receiver calls with project-specific names always keep their edge
+     * (namespace-import member calls: repo.updateStatusIf). */
+    ASSERT_FALSE(cbm_js_suppress_generic_match(true, true, "repo.updateStatusIf", "unique_name"));
+    /* Bare calls are out of scope — governed by import/param guards. */
+    ASSERT_FALSE(cbm_js_suppress_generic_match(true, false, "add", "unique_name"));
+    /* High-confidence strategies pass through even for generic names. */
+    ASSERT_FALSE(cbm_js_suppress_generic_match(true, true, "store.get", "same_module"));
+    ASSERT_FALSE(cbm_js_suppress_generic_match(true, true, "api.get", "import_map"));
+    ASSERT_FALSE(cbm_js_suppress_generic_match(true, true, "api.get", "qualified_suffix"));
+    ASSERT_FALSE(cbm_js_suppress_generic_match(true, true, "api.get", "lsp_ts_import"));
+    ASSERT_FALSE(cbm_js_suppress_generic_match(true, true, "api.get", "field_type_hint"));
+    /* Non-JS languages are never affected. */
+    ASSERT_FALSE(cbm_js_suppress_generic_match(false, true, "redis.set", "unique_name"));
+    /* No match (NULL/empty strategy) → nothing to suppress. */
+    ASSERT_FALSE(cbm_js_suppress_generic_match(true, true, "redis.set", NULL));
+    ASSERT_FALSE(cbm_js_suppress_generic_match(true, true, "redis.set", ""));
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(registry) {
@@ -808,4 +863,8 @@ SUITE(registry) {
     RUN_TEST(perl_builtin_set_rejects_project_subs);
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
+    RUN_TEST(js_generic_set_recognizes_prototype_methods);
+    RUN_TEST(js_generic_set_rejects_project_names);
+    RUN_TEST(js_suppress_drops_weak_generic_receiver_matches);
+    RUN_TEST(js_suppress_keeps_specific_and_high_confidence_matches);
 }

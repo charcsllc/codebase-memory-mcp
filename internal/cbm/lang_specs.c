@@ -1266,13 +1266,10 @@ static const char *templ_module_types[] = {"source_file", NULL};
 static const char *liquid_import_types[] = {"include", "include_statement", NULL};
 static const char *liquid_module_types[] = {"template", NULL};
 static const char *jinja2_module_types[] = {"source_file", NULL};
-static const char *prisma_class_types[] = {"model_declaration",
-                                           "enum_declaration",
-                                           "type_declaration",
-                                           "generator_declaration",
-                                           "datasource_declaration",
-                                           "view_declaration",
-                                           NULL};
+/* generator/datasource blocks are connection config, not domain types —
+ * they must not become graph Class nodes. */
+static const char *prisma_class_types[] = {"model_declaration", "enum_declaration",
+                                           "type_declaration", "view_declaration", NULL};
 static const char *prisma_field_types[] = {"column_declaration", NULL};
 static const char *prisma_call_types[] = {"call_expression", NULL};
 static const char *prisma_module_types[] = {"program", NULL};

@@ -1789,6 +1789,11 @@ void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *ou
     *in_deg = 0;
     *out_deg = 0;
 
+    /* CALLS-only ON PURPOSE — this is the call-graph degree used by Cypher's
+     * virtual in_degree/out_degree (dead-code queries) and get_code_snippet's
+     * caller/callee counts. Graph-wide relevance degrees (incl. USAGE/
+     * INHERITS/IMPLEMENTS and the HTTP_CALLS/HANDLES/INFRA_MAPS service
+     * edges) live in cbm_store_search's in_deg/out_deg columns instead. */
     const char *in_sql = "SELECT COUNT(*) FROM edges WHERE target_id = ?1 AND type = 'CALLS'";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, in_sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK) {
@@ -2449,12 +2454,20 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     char count_sql[CBM_SZ_4K];
     int bind_idx = 0;
 
+    /* Degree = graph relevance: code edges (CALLS/USAGE/INHERITS/IMPLEMENTS)
+     * plus service edges (HTTP_CALLS/HANDLES/INFRA_MAPS) so Route pseudo-
+     * nodes reached only by clients/handlers don't report degree 0.
+     * Deliberately BROADER than cbm_store_node_degree (CALLS-only call-graph
+     * degree for Cypher/snippets) and than search_code's batch ranking
+     * (CALLS-only centrality signal). */
     const char *select_cols = "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
                               "n.file_path, n.start_line, n.end_line, n.properties, "
                               "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND "
-                              "e.type IN ('CALLS', 'USAGE', 'INHERITS', 'IMPLEMENTS')) AS in_deg, "
+                              "e.type IN ('CALLS', 'USAGE', 'INHERITS', 'IMPLEMENTS', "
+                              "'HTTP_CALLS', 'HANDLES', 'INFRA_MAPS')) AS in_deg, "
                               "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND "
-                              "e.type IN ('CALLS', 'USAGE', 'INHERITS', 'IMPLEMENTS')) AS out_deg ";
+                              "e.type IN ('CALLS', 'USAGE', 'INHERITS', 'IMPLEMENTS', "
+                              "'HTTP_CALLS', 'HANDLES', 'INFRA_MAPS')) AS out_deg ";
 
     char where[CBM_SZ_2K] = "";
     search_bind_t binds[ST_SEARCH_MAX_BINDS];
@@ -3706,6 +3719,7 @@ static int arch_hotspots(cbm_store_t *s, const char *project, const char *path,
     char sqlbuf[ST_SQL_BUF];
     const char *base = "SELECT n.name, n.qualified_name, COUNT(*) as fan_in "
                        "FROM nodes n JOIN edges e ON e.target_id = n.id AND e.type = 'CALLS' "
+                       "AND e.source_id != e.target_id "
                        "WHERE n.project=?1 AND n.label IN ('Function', 'Method') "
                        "AND (json_extract(n.properties, '$.is_test') IS NULL OR "
                        "json_extract(n.properties, '$.is_test') != 1) "

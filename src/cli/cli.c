@@ -382,6 +382,26 @@ int cbm_copy_binary_to_target(const char *src, const char *dst) {
     if (cbm_same_file(src, dst)) {
         return 0; /* already in place — nothing to copy */
     }
+    /* Unlink-then-copy, mirroring cbm_replace_binary below: opening the
+     * existing target "wb" fails with ETXTBSY when it is the RUNNING server
+     * binary (the common upgrade path: `install --force` while an editor
+     * session keeps the MCP server up) and with EACCES when it is
+     * read-only. Unlink succeeds in both cases on Unix — the running
+     * process keeps its inode until it exits. Windows can't unlink a
+     * running .exe: rename it aside instead. */
+    struct stat st_check;
+    if (stat(dst, &st_check) == 0 && cbm_unlink(dst) != 0) {
+#ifdef _WIN32
+        char old_path[CLI_BUF_1K];
+        snprintf(old_path, sizeof(old_path), "%s.old", dst);
+        (void)cbm_unlink(old_path);
+        if (rename(dst, old_path) != 0) {
+            return CLI_ERR;
+        }
+#else
+        return CLI_ERR;
+#endif
+    }
     if (cbm_copy_file(src, dst) != 0) {
         return CLI_ERR;
     }

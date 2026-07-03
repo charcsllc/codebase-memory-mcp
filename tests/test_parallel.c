@@ -702,6 +702,563 @@ TEST(grpc_no_phantom_route_from_plain_var_issue294) {
     PASS();
 }
 
+/* ── D1: spurious CALLS self-loops from unresolved suffix matches ── */
+
+/* An unresolved method call whose name suffix-matches a route-registration
+ * method (.get/.post/.delete/...) but whose args carry no '/path' must NOT
+ * emit a CALLS self-loop on the enclosing function. Bug: resolve_file_calls
+ * passed source_node as target for the fake "callee_suffix" resolution and
+ * emit_service_edge's no-path fall-through emitted a normal CALLS edge. */
+
+typedef struct {
+    int self_loops;
+    int total_calls;
+} self_loop_ctx_t;
+
+static void count_self_loop_calls(const cbm_gbuf_edge_t *edge, void *ud) {
+    self_loop_ctx_t *c = ud;
+    if (!edge || !edge->type || strcmp(edge->type, "CALLS") != 0) {
+        return;
+    }
+    c->total_calls++;
+    if (edge->source_id == edge->target_id) {
+        c->self_loops++;
+    }
+}
+
+TEST(parallel_unresolved_suffix_call_no_self_loop) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_selfloop_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/session.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen session.ts failed");
+    }
+    /* `redis` is never defined or imported: registry resolution fails, the
+     * ".get" suffix matches a route-registration method, and the argument
+     * is a plain identifier (no '/path'). getSession is NOT recursive. */
+    fprintf(f, "export function getSession(sid: string) {\n"
+               "  return redis.get(sid)\n"
+               "}\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"session.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_selfloop", tmpdir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    self_loop_ctx_t c = {0};
+    cbm_gbuf_foreach_edge(gbuf, count_self_loop_calls, &c);
+    ASSERT_EQ(c.self_loops, 0);
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* Paired control: a route registration WITH a '/path' arg must still create
+ * the Route node even when the receiver (app) does not resolve. */
+TEST(parallel_unresolved_suffix_call_route_still_created) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_selfroute_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/routes.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen routes.ts failed");
+    }
+    fprintf(f, "function handler() { return 1 }\n"
+               "export function routes(app: any) {\n"
+               "  app.get('/x', handler)\n"
+               "}\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"routes.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_selfroute", tmpdir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_node_t *route = cbm_gbuf_find_by_qn(gbuf, "__route__GET__/x");
+    ASSERT_NOT_NULL(route);
+
+    self_loop_ctx_t c = {0};
+    cbm_gbuf_foreach_edge(gbuf, count_self_loop_calls, &c);
+    ASSERT_EQ(c.self_loops, 0);
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* ── D4: route-registration handler must be the real handler arg ── */
+
+/* Fastify-style `app.post(path, OPTS, handler)`: the named options object
+ * must NOT become the HANDLES source; the trailing handler reference must.
+ * Inline arrow handlers get a synthetic def (__handler_L<line>) so the
+ * route is handled by the arrow's node — never by OPTS. */
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    int64_t route_x_id;
+    int64_t route_y_id;
+    int64_t handler_id;
+    int64_t opts_id;
+    int handles_to_x_from_handler;
+    int handles_to_x_total;
+    int handles_to_y_total;
+} d4_ctx_t;
+
+static void d4_scan_handles(const cbm_gbuf_edge_t *edge, void *ud) {
+    d4_ctx_t *c = ud;
+    if (!edge || !edge->type || strcmp(edge->type, "HANDLES") != 0) {
+        return;
+    }
+    if (edge->target_id == c->route_x_id) {
+        c->handles_to_x_total++;
+        if (edge->source_id == c->handler_id) {
+            c->handles_to_x_from_handler++;
+        }
+    }
+    if (edge->target_id == c->route_y_id) {
+        c->handles_to_y_total++;
+    }
+}
+
+TEST(parallel_route_options_object_not_handler) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_optshnd_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/routes.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen routes.ts failed");
+    }
+    fprintf(f, "const OPTS = { config: { rateLimit: { max: 10 } } }\n"
+               "function handler(req: any) { return 1 }\n"
+               "export function routes(app: any) {\n"
+               "  app.post('/x', OPTS, handler)\n"
+               "  app.post('/y', OPTS, async (req: any) => { return 2 })\n"
+               "  app.get('/s', handler)\n"
+               "}\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"routes.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_optshnd", tmpdir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_node_t *route_x = cbm_gbuf_find_by_qn(gbuf, "__route__POST__/x");
+    const cbm_gbuf_node_t *route_y = cbm_gbuf_find_by_qn(gbuf, "__route__POST__/y");
+    const cbm_gbuf_node_t *route_s = cbm_gbuf_find_by_qn(gbuf, "__route__GET__/s");
+    ASSERT_NOT_NULL(route_x);
+    ASSERT_NOT_NULL(route_y);
+    ASSERT_NOT_NULL(route_s); /* control: plain (path, handler) keeps working */
+
+    d4_ctx_t c = {0};
+    c.route_x_id = route_x->id;
+    c.route_y_id = route_y->id;
+    const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(gbuf, "cbm_par_optshnd.routes.handler");
+    if (!handler) {
+        /* QN shape may differ; find by scanning is overkill — HANDLES source
+         * assertions below use the id only when found. */
+        c.handler_id = -1;
+    } else {
+        c.handler_id = handler->id;
+    }
+    cbm_gbuf_foreach_edge(gbuf, d4_scan_handles, &c);
+
+    /* /x must be handled by `handler` and by nothing else (not OPTS). */
+    ASSERT_EQ(c.handles_to_x_total, 1);
+    if (c.handler_id != -1) {
+        ASSERT_EQ(c.handles_to_x_from_handler, 1);
+    }
+    /* /y's handler is an inline arrow: exactly one HANDLES edge, from its
+     * synthetic def (line 5) — never from OPTS. */
+    ASSERT_EQ(c.handles_to_y_total, 1);
+    const cbm_gbuf_node_t *anon_h =
+        cbm_gbuf_find_by_qn(gbuf, "cbm_par_optshnd.routes.__handler_L5");
+    ASSERT_NOT_NULL(anon_h);
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* ── D2: bare-name resolution must not invent cross-file member calls ── */
+
+typedef struct {
+    int64_t target_id;
+    int count;
+} calls_to_id_ctx_t;
+
+static void count_calls_to_id(const cbm_gbuf_edge_t *edge, void *ud) {
+    calls_to_id_ctx_t *c = ud;
+    if (edge && edge->type && strcmp(edge->type, "CALLS") == 0 &&
+        edge->target_id == c->target_id) {
+        c->count++;
+    }
+}
+
+static int d2_write_file(const char *dir, const char *name, const char *content, char *out,
+                         size_t outsz) {
+    snprintf(out, outsz, "%s/%s", dir, name);
+    FILE *f = fopen(out, "w");
+    if (!f) {
+        return -1;
+    }
+    fputs(content, f);
+    fclose(f);
+    return 0;
+}
+
+/* `s.add(x)` where `s` is a local Set must NOT resolve to an unrelated
+ * project function that merely shares the name `add` (no import path). */
+TEST(parallel_generic_method_name_not_resolved_cross_file) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_d2a_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fa[512], fb[512];
+    ASSERT_EQ(d2_write_file(tmpdir, "a.ts",
+                            "const s = new Set<number>()\n"
+                            "export function useIt(x: number) { s.add(x) }\n",
+                            fa, sizeof(fa)),
+              0);
+    ASSERT_EQ(d2_write_file(tmpdir, "b.ts",
+                            "export function add(a: number, b: number) { return a + b }\n", fb,
+                            sizeof(fb)),
+              0);
+
+    cbm_file_info_t files[2] = {{0}, {0}};
+    files[0].path = fa;
+    files[0].rel_path = (char *)"a.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+    files[1].path = fb;
+    files[1].rel_path = (char *)"b.ts";
+    files[1].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_d2a", tmpdir, files, 2, 1);
+    ASSERT_NOT_NULL(gbuf);
+    const cbm_gbuf_node_t *add_fn = cbm_gbuf_find_by_qn(gbuf, "cbm_par_d2a.b.add");
+    ASSERT_NOT_NULL(add_fn);
+    calls_to_id_ctx_t c = {add_fn->id, 0};
+    cbm_gbuf_foreach_edge(gbuf, count_calls_to_id, &c);
+    ASSERT_EQ(c.count, 0);
+    cbm_gbuf_free(gbuf);
+    unlink(fa);
+    unlink(fb);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* A callback PARAMETER being invoked must not be wired to an unrelated
+ * project function of the same name in another file. */
+TEST(parallel_callback_param_not_resolved_cross_file) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_d2b_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char ff[512], fg[512];
+    ASSERT_EQ(d2_write_file(tmpdir, "f.ts",
+                            "export function wrap(run: () => void) { run() }\n", ff, sizeof(ff)),
+              0);
+    ASSERT_EQ(d2_write_file(tmpdir, "g.ts", "export function run() { return 1 }\n", fg,
+                            sizeof(fg)),
+              0);
+
+    cbm_file_info_t files[2] = {{0}, {0}};
+    files[0].path = ff;
+    files[0].rel_path = (char *)"f.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+    files[1].path = fg;
+    files[1].rel_path = (char *)"g.ts";
+    files[1].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_d2b", tmpdir, files, 2, 1);
+    ASSERT_NOT_NULL(gbuf);
+    const cbm_gbuf_node_t *run_fn = cbm_gbuf_find_by_qn(gbuf, "cbm_par_d2b.g.run");
+    ASSERT_NOT_NULL(run_fn);
+    calls_to_id_ctx_t c = {run_fn->id, 0};
+    cbm_gbuf_foreach_edge(gbuf, count_calls_to_id, &c);
+    ASSERT_EQ(c.count, 0);
+    cbm_gbuf_free(gbuf);
+    unlink(ff);
+    unlink(fg);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* Control: an IMPORTED function keeps its CALLS edge even when its name is
+ * in the generic-method set (import_map / lsp strategies stay intact). */
+TEST(parallel_imported_generic_name_keeps_edge) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_d2c_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fc[512], fd[512];
+    ASSERT_EQ(d2_write_file(tmpdir, "c.ts", "export function add(a: number) { return a }\n", fc,
+                            sizeof(fc)),
+              0);
+    ASSERT_EQ(d2_write_file(tmpdir, "d.ts",
+                            "import { add } from './c'\n"
+                            "export function useAdd() { return add(1) }\n",
+                            fd, sizeof(fd)),
+              0);
+
+    cbm_file_info_t files[2] = {{0}, {0}};
+    files[0].path = fc;
+    files[0].rel_path = (char *)"c.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+    files[1].path = fd;
+    files[1].rel_path = (char *)"d.ts";
+    files[1].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_d2c", tmpdir, files, 2, 1);
+    ASSERT_NOT_NULL(gbuf);
+    const cbm_gbuf_node_t *add_fn = cbm_gbuf_find_by_qn(gbuf, "cbm_par_d2c.c.add");
+    ASSERT_NOT_NULL(add_fn);
+    calls_to_id_ctx_t c = {add_fn->id, 0};
+    cbm_gbuf_foreach_edge(gbuf, count_calls_to_id, &c);
+    ASSERT_GTE(c.count, 1);
+    cbm_gbuf_free(gbuf);
+    unlink(fc);
+    unlink(fd);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* ── D7: direct global fetch() calls must emit HTTP_CALLS ─────────── */
+
+typedef struct {
+    int http_calls;
+} http_calls_ctx_t;
+
+static void count_http_calls(const cbm_gbuf_edge_t *edge, void *ud) {
+    http_calls_ctx_t *c = ud;
+    if (edge && edge->type && strcmp(edge->type, "HTTP_CALLS") == 0) {
+        c->http_calls++;
+    }
+}
+
+TEST(parallel_global_fetch_emits_http_calls) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_fetch_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/client.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen client.ts failed");
+    }
+    fprintf(f, "export async function loadX() {\n"
+               "  const r = await fetch('/api/x/items')\n"
+               "  return r\n"
+               "}\n"
+               "export async function loadY(qs: string) {\n"
+               "  return fetch(`/api/y/list${qs}`)\n"
+               "}\n"
+               "export async function createZ(body: string) {\n"
+               "  return fetch('/api/z/items', { method: 'POST', body })\n"
+               "}\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"client.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_fetch", tmpdir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    http_calls_ctx_t c = {0};
+    cbm_gbuf_foreach_edge(gbuf, count_http_calls, &c);
+    ASSERT_GTE(c.http_calls, 3);
+
+    /* Plain path → ANY; template-literal querystring is trimmed; an
+     * init object with method: 'POST' upgrades the route method. */
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__ANY__/api/x/items"));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__ANY__/api/y/list"));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__POST__/api/z/items"));
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* ── Debt 2: sequential pipeline parity for URL/fetch detection ──── */
+
+/* The sequential pipeline (repos under MIN_FILES_FOR_PARALLEL) must emit
+ * the same HTTP_CALLS evidence as the parallel one: direct global fetch()
+ * calls and URL-shaped args of resolved calls. */
+TEST(sequential_url_and_fetch_detection_parity) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_seq_fetch_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/client.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen client.ts failed");
+    }
+    fprintf(f, "export async function loadX() {\n"
+               "  const r = await fetch('/api/x/items')\n"
+               "  return r\n"
+               "}\n"
+               "export async function createZ(body: string) {\n"
+               "  return fetch('/api/z/items', { method: 'POST', body })\n"
+               "}\n"
+               "function post(u: string) { return u }\n"
+               "export function callit() { return post('/api/p/items') }\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"client.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_sequential("cbm_seq_fetch", tmpdir, files, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    http_calls_ctx_t c = {0};
+    cbm_gbuf_foreach_edge(gbuf, count_http_calls, &c);
+    ASSERT_GTE(c.http_calls, 3);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__ANY__/api/x/items"));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__POST__/api/z/items"));
+    /* resolved same-module call with a URL arg → arg_url evidence */
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__ANY__/api/p/items"));
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* ── Debt 4: template-literal URLs feed first_string_arg ──────────── */
+
+/* An unresolved axios.get with a template URL classifies as HTTP via the
+ * callee-suffix fallback; with the template feeding first_string_arg the
+ * edge carries the real METHOD instead of only the ANY arg_url evidence. */
+TEST(parallel_template_url_gets_method_route) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_tpl_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/client2.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen client2.ts failed");
+    }
+    fprintf(f, "export async function z(id: string) {\n"
+               "  return axios.get(`/api/z/${id}`)\n"
+               "}\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"client2.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_tpl", tmpdir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__GET__/api/z/{}"));
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* ── Debt 1: inline route handlers get a synthetic node + HANDLES ── */
+
+/* An anonymous arrow passed as the handler of a route registration has no
+ * name, so no Function node existed and the route had no HANDLES edge.
+ * A deterministic synthetic def (__handler_L<line>) restores the handler
+ * identity without re-attributing the body's calls (the enclosing named
+ * function keeps them — CALLS sources stay stable). */
+TEST(parallel_inline_route_handler_gets_node_and_handles) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_inlh_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/routes.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen routes.ts failed");
+    }
+    fprintf(f, "function namedHandler() { return 2 }\n"
+               "export function routes(app: any) {\n"
+               "  app.post('/inline', { schema: 1 }, async (req: any) => { return req })\n"
+               "  app.get('/named', namedHandler)\n"
+               "}\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"routes.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_inlh", tmpdir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_node_t *route_inline = cbm_gbuf_find_by_qn(gbuf, "__route__POST__/inline");
+    const cbm_gbuf_node_t *route_named = cbm_gbuf_find_by_qn(gbuf, "__route__GET__/named");
+    ASSERT_NOT_NULL(route_inline);
+    ASSERT_NOT_NULL(route_named);
+
+    /* The arrow starts on line 3 → synthetic def __handler_L3. */
+    const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn(gbuf, "cbm_par_inlh.routes.__handler_L3");
+    ASSERT_NOT_NULL(h);
+    ASSERT_EQ(h->start_line, 3);
+
+    d4_ctx_t c = {0};
+    c.route_x_id = route_inline->id;
+    c.route_y_id = route_named->id;
+    c.handler_id = h->id;
+    cbm_gbuf_foreach_edge(gbuf, d4_scan_handles, &c);
+    ASSERT_EQ(c.handles_to_x_total, 1);
+    ASSERT_EQ(c.handles_to_x_from_handler, 1);
+    /* Control: the named handler keeps its HANDLES. */
+    ASSERT_EQ(c.handles_to_y_total, 1);
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
@@ -729,6 +1286,16 @@ SUITE(parallel) {
     RUN_TEST(parallel_total_edges);
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);
+    RUN_TEST(parallel_unresolved_suffix_call_no_self_loop);
+    RUN_TEST(parallel_unresolved_suffix_call_route_still_created);
+    RUN_TEST(parallel_route_options_object_not_handler);
+    RUN_TEST(parallel_generic_method_name_not_resolved_cross_file);
+    RUN_TEST(parallel_callback_param_not_resolved_cross_file);
+    RUN_TEST(parallel_imported_generic_name_keeps_edge);
+    RUN_TEST(parallel_global_fetch_emits_http_calls);
+    RUN_TEST(sequential_url_and_fetch_detection_parity);
+    RUN_TEST(parallel_template_url_gets_method_route);
+    RUN_TEST(parallel_inline_route_handler_gets_node_and_handles);
 
     /* Cleanup shared state */
     parity_teardown();

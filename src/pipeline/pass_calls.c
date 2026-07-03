@@ -316,6 +316,7 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     }
     if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
         emit_http_async_edge(ctx, call, source, target, res, svc);
+        cbm_pipeline_detect_url_in_args(ctx->gbuf, source, call);
         return;
     }
     if (svc == CBM_SVC_CONFIG) {
@@ -328,6 +329,7 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                  esc_c, esc_k, res->confidence);
         calls_emit_edge(ctx->gbuf, source->id, target->id, "CONFIGURES", props, sizeof(props),
                         call);
+        cbm_pipeline_detect_url_in_args(ctx->gbuf, source, call);
         return;
     }
     char esc_c2[CBM_SZ_256];
@@ -338,6 +340,9 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
              esc_c2, res->confidence, res->strategy ? res->strategy : "unknown",
              res->candidate_count);
     calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props), call);
+    /* Mirror the parallel path (emit_service_edge tail): URL-shaped args
+     * always leave arg_url HTTP_CALLS evidence, whatever the edge class. */
+    cbm_pipeline_detect_url_in_args(ctx->gbuf, source, call);
 }
 
 /* Find source node for a call: enclosing function or file node. */
@@ -387,6 +392,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     cbm_resolution_t res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn,
                                                 imp_keys, imp_vals, imp_count);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
+        /* Direct global fetch(): a browser/Node builtin that never resolves
+         * to a project symbol — mirror the parallel path's capture. */
+        if ((lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+             lang == CBM_LANG_JAVASCRIPT) &&
+            cbm_pipeline_is_global_fetch(call->callee_name)) {
+            cbm_pipeline_emit_global_fetch_edge(ctx->gbuf, source_node, call);
+        }
         return 0;
     }
 
@@ -400,6 +412,24 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * to Perl — other languages are unaffected. */
     if (cbm_perl_suppress_generic_match(lang == CBM_LANG_PERL, call->is_method, call->callee_name,
                                         res.strategy)) {
+        return 0;
+    }
+    /* JS/TS mirror of the Perl guard — see cbm_js_suppress_generic_match. A
+     * resolved QN matching a service pattern (bullmq queue.add, ...) is kept:
+     * it classifies as ASYNC/HTTP_CALLS, not noisy plain CALLS. */
+    bool lang_is_js =
+        (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_JAVASCRIPT);
+    bool svc_qn = res.qualified_name && res.qualified_name[0] &&
+                  cbm_service_pattern_match(res.qualified_name) != CBM_SVC_NONE;
+    if (!svc_qn && cbm_js_suppress_generic_match(lang_is_js, call->is_method, call->callee_name,
+                                                 res.strategy)) {
+        return 0;
+    }
+    /* Invoking a callback PARAMETER of the enclosing function (detected at
+     * extraction — is_param_call) can never be a cross-file call to a
+     * project function sharing the name: drop weak short-name guesses. */
+    if (lang_is_js && call->is_param_call && res.strategy &&
+        (strcmp(res.strategy, "unique_name") == 0 || strcmp(res.strategy, "suffix_match") == 0)) {
         return 0;
     }
     const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);

@@ -243,6 +243,18 @@ static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *so
     TSNode func_node = ts_node_child_by_field_name(node, TS_FIELD("function"));
     if (!ts_node_is_null(func_node)) {
         const char *fk = ts_node_type(func_node);
+        // TS/JS: `await g<T>(x)` parses as call_expression(function:
+        // await_expression(identifier), type_arguments, arguments); `(g)(x)`
+        // and `g!(x)` wrap the callee the same way. Unwrap one level to the
+        // named child so the callee is classified normally instead of dropped.
+        if (strcmp(fk, "await_expression") == 0 || strcmp(fk, "parenthesized_expression") == 0 ||
+            strcmp(fk, "non_null_expression") == 0) {
+            TSNode inner = ts_node_named_child(func_node, 0);
+            if (!ts_node_is_null(inner)) {
+                func_node = inner;
+                fk = ts_node_type(func_node);
+            }
+        }
         if (strcmp(fk, "selector_expression") == 0) {
             return resolve_chained_selector(a, func_node, source);
         }
@@ -1009,6 +1021,28 @@ static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const 
             return validated;
         }
     }
+    // TS/JS template literal in URL position (`/api/z/${id}`): strip the
+    // backticks and keep the ${...} markers — route canonicalization
+    // collapses them downstream. URL-shaped content only, so template
+    // topics/config keys don't leak into first_string_arg through this
+    // branch (is_string_like stays literal-only on purpose: its other
+    // consumers — handler strings, string dispatch — need real literals).
+    if (strcmp(ak, "template_string") == 0) {
+        char *text = cbm_node_text(ctx->arena, arg, ctx->source);
+        if (text && text[0] == '`') {
+            int len = (int)strlen(text);
+            if (len >= CBM_QUOTE_PAIR && text[len - 1] == '`') {
+                char *inner = cbm_arena_strndup(ctx->arena, text + CBM_QUOTE_OFFSET,
+                                                (size_t)(len - CBM_QUOTE_PAIR));
+                const char *validated = strip_and_validate_string_arg(ctx->arena, inner);
+                if (validated &&
+                    (validated[0] == '/' || strstr(validated, "://") != NULL)) {
+                    return validated;
+                }
+            }
+        }
+        return NULL;
+    }
     if (strcmp(ak, "identifier") == 0) {
         char *const_name = cbm_node_text(ctx->arena, arg, ctx->source);
         if (const_name) {
@@ -1077,6 +1111,13 @@ static const char *normalize_string_handler(CBMArena *a, const char *raw) {
 
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
     uint32_t nc = ts_node_named_child_count(args);
+    /* The handler is the LAST function-like argument: Fastify/Express place
+     * options objects and middleware before it (app.post(path, OPTS,
+     * handler)), so a first-match scan wires the options object as handler.
+     * An inline arrow/function handler has no name to resolve — it clears any
+     * earlier reference so no HANDLES edge is fabricated from middleware or
+     * options constants. */
+    const char *best = NULL;
     for (uint32_t ai = HANDLER_START_IDX; ai < nc && ai < MAX_HANDLER_SCAN; ai++) {
         TSNode arg2 = ts_node_named_child(args, ai);
         /* PHP wraps each argument in an `argument` node — unwrap to the value. */
@@ -1084,22 +1125,36 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
             arg2 = ts_node_named_child(arg2, 0);
         }
         const char *ak2 = ts_node_type(arg2);
+        if (strcmp(ak2, "arrow_function") == 0 || strcmp(ak2, "function_expression") == 0 ||
+            strcmp(ak2, "function") == 0 || strcmp(ak2, "generator_function") == 0 ||
+            strcmp(ak2, "anonymous_function") == 0 ||
+            strcmp(ak2, "anonymous_function_creation_expression") == 0 ||
+            strcmp(ak2, "lambda") == 0) {
+            /* Inline handler: reference the synthetic def extract_func_def
+             * creates for route-handler args (same name derivation), so the
+             * HANDLES edge lands on the real handler body. It still clears
+             * any earlier reference (options/middleware must not win). */
+            best = cbm_anon_handler_name(ctx->arena, arg2);
+            continue;
+        }
         /* `name` = PHP bare identifier handler; string = Laravel string handler
          * ('showUsers' or 'Controller@method'). */
         if (strcmp(ak2, "identifier") == 0 || strcmp(ak2, "member_expression") == 0 ||
             strcmp(ak2, "selector_expression") == 0 || strcmp(ak2, "attribute") == 0 ||
             strcmp(ak2, "field_expression") == 0 || strcmp(ak2, "name") == 0) {
-            return cbm_node_text(ctx->arena, arg2, ctx->source);
+            best = cbm_node_text(ctx->arena, arg2, ctx->source);
+            continue;
         }
         if (is_string_like(ak2)) {
             const char *h =
                 normalize_string_handler(ctx->arena, cbm_node_text(ctx->arena, arg2, ctx->source));
             if (h && h[0]) {
-                return h;
+                best = h;
             }
         }
+        /* Object/array literals (options, schema) are never handlers: skip. */
     }
-    return NULL;
+    return best;
 }
 
 // Extract JSX component refs (uppercase tags) as CALLS edges.
@@ -1135,13 +1190,40 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
             call.loop_depth = state->loop_depth;     // enclosing loop nesting at this call
             call.branch_depth = state->branch_depth; // enclosing branch nesting at this call
             call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
-            // Perl-only: flag arrow/method calls ($obj->m / Class->m). The
-            // generic short-name resolver cannot place a method without a known
-            // receiver type, so the call-resolution pass suppresses those edges.
-            // Default false for every other language (struct is zero-init).
+            // Flag receiver calls. The generic short-name resolver cannot
+            // place a method without a known receiver type, so the
+            // call-resolution noise guards suppress weak matches for these.
+            // Perl: $obj->m / Class->m. TS/JS: the extracted callee keeps
+            // its dotted receiver ("redis.set"). Default false elsewhere
+            // (struct is zero-init).
             if (ctx->language == CBM_LANG_PERL &&
                 strcmp(ts_node_type(node), "method_call_expression") == 0) {
                 call.is_method = true;
+            }
+            if ((ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX ||
+                 ctx->language == CBM_LANG_JAVASCRIPT) &&
+                strchr(callee, '.') != NULL) {
+                call.is_method = true;
+            }
+            // A bare callee that names a PARAMETER of its enclosing function
+            // is a callback invocation — it can never resolve to another
+            // file's function. The enclosing def was pushed before its body
+            // walk, so scan defs backwards for the matching QN.
+            if (!strchr(callee, '.') && state->enclosing_func_qn) {
+                for (int di = ctx->result->defs.count - 1; di >= 0; di--) {
+                    const CBMDefinition *ed = &ctx->result->defs.items[di];
+                    if (!ed->qualified_name ||
+                        strcmp(ed->qualified_name, state->enclosing_func_qn) != 0) {
+                        continue;
+                    }
+                    for (const char **pn = ed->param_names; pn && *pn; pn++) {
+                        if (strcmp(*pn, callee) == 0) {
+                            call.is_param_call = true;
+                            break;
+                        }
+                    }
+                    break;
+                }
             }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));

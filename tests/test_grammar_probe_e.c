@@ -143,7 +143,8 @@ static int gpe_count_label(cbm_store_t *store, const char *project, const char *
 
 /* Sum of all type-like labels. */
 static int gpe_type_nodes(cbm_store_t *store, const char *project) {
-    static const char *labels[] = {"Class","Struct","Interface","Enum","Trait","Type",NULL};
+    /* "Model" — Prisma schema models are type-like domain definitions. */
+    static const char *labels[] = {"Class","Struct","Interface","Enum","Trait","Type","Model",NULL};
     int total = 0;
     for (int i = 0; labels[i]; i++) {
         int n = gpe_count_label(store, project, labels[i]);
@@ -703,7 +704,7 @@ TEST(probe_prisma_model_node) {
         "  email String @unique\n"
         "}\n");
     ASSERT_TRUE(m.ok);
-    /* GREEN: `model User` must produce a Class node. */
+    /* GREEN: `model User` must produce a type-like (Model) node. */
     ASSERT_TRUE(m.types >= 1);
     PASS();
 }
@@ -725,7 +726,7 @@ TEST(probe_prisma_multiple_models) {
         "  author   User   @relation(fields: [authorId], references: [id])\n"
         "}\n");
     ASSERT_TRUE(m.ok);
-    /* GREEN: two model definitions → at least 2 Class nodes. */
+    /* GREEN: two model definitions → at least 2 type-like (Model) nodes. */
     ASSERT_TRUE(m.types >= 2);
     PASS();
 }
