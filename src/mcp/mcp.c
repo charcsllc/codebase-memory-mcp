@@ -2276,7 +2276,30 @@ static bool is_test_file(const char *path) {
 static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_result_t *tr,
                                          bool risk_labels, bool include_tests) {
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    /* The BFS CTE keeps one row per (node, hop) pair, so a node reachable
+     * through paths of different lengths repeats. Rows arrive ordered by
+     * hop ascending: keeping the first occurrence keeps the minimum hop.
+     * (Dedup here, not in the SQL — Cypher var-length *m..n patterns need
+     * the per-hop rows.) */
+    int64_t *seen = tr->visited_count > 0
+                        ? malloc(sizeof(int64_t) * (size_t)tr->visited_count)
+                        : NULL;
+    int seen_count = 0;
     for (int i = 0; i < tr->visited_count; i++) {
+        int64_t nid = tr->visited[i].node.id;
+        bool dup = false;
+        for (int s = 0; s < seen_count; s++) {
+            if (seen[s] == nid) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        if (seen) {
+            seen[seen_count++] = nid;
+        }
         const char *fp = tr->visited[i].node.file_path;
         bool test = is_test_file(fp);
         if (!include_tests && test) {
@@ -2298,6 +2321,7 @@ static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_resul
         }
         yyjson_mut_arr_add_val(arr, item);
     }
+    free(seen);
     return arr;
 }
 

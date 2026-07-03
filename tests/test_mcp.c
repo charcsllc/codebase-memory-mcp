@@ -711,6 +711,68 @@ TEST(tool_trace_call_path_prefers_definition) {
     PASS();
 }
 
+/* D9b: a node reachable through paths of different lengths (A->C and
+ * A->B->C) must appear ONCE in the trace (at its minimum hop), not once
+ * per distinct path length. */
+TEST(tool_trace_call_path_dedupes_multipath_node) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "bfsdedup-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/bfsdedup");
+    cbm_node_t a = {.project = proj,
+                    .label = "Function",
+                    .name = "alphaFn",
+                    .qualified_name = "bfsdedup-proj.src.alphaFn",
+                    .file_path = "src/a.c",
+                    .start_line = 1,
+                    .end_line = 10};
+    cbm_node_t b = {.project = proj,
+                    .label = "Function",
+                    .name = "bravoFn",
+                    .qualified_name = "bfsdedup-proj.src.bravoFn",
+                    .file_path = "src/b.c",
+                    .start_line = 1,
+                    .end_line = 10};
+    cbm_node_t c = {.project = proj,
+                    .label = "Function",
+                    .name = "charlieFn",
+                    .qualified_name = "bfsdedup-proj.src.charlieFn",
+                    .file_path = "src/c.c",
+                    .start_line = 1,
+                    .end_line = 10};
+    int64_t ida = cbm_store_upsert_node(st, &a);
+    int64_t idb = cbm_store_upsert_node(st, &b);
+    int64_t idc = cbm_store_upsert_node(st, &c);
+    ASSERT_GT(ida, 0);
+    ASSERT_GT(idb, 0);
+    ASSERT_GT(idc, 0);
+    cbm_edge_t e1 = {.project = proj, .source_id = ida, .target_id = idb, .type = "CALLS"};
+    cbm_edge_t e2 = {.project = proj, .source_id = idb, .target_id = idc, .type = "CALLS"};
+    cbm_edge_t e3 = {.project = proj, .source_id = ida, .target_id = idc, .type = "CALLS"};
+    cbm_store_insert_edge(st, &e1);
+    cbm_store_insert_edge(st, &e2);
+    cbm_store_insert_edge(st, &e3);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":"
+             "\"alphaFn\",\"project\":\"bfsdedup-proj\",\"direction\":\"outbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    int charlie_count = 0;
+    for (const char *p = inner; (p = strstr(p, "charlieFn")) != NULL; p++) {
+        charlie_count++;
+    }
+    /* qualified_name and name both contain "charlieFn": 2 hits per entry. */
+    ASSERT_EQ(charlie_count, 2);
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_delete_project_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -2377,6 +2439,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_call_path_prefers_definition);
+    RUN_TEST(tool_trace_call_path_dedupes_multipath_node);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
