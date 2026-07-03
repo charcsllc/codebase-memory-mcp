@@ -120,6 +120,43 @@ TEST(extract_ts_factory_object_methods_issue341) {
     PASS();
 }
 
+/* --- TS: `await f<T>(...)` with explicit type arguments keeps the call --- */
+/* With explicit generics the call parses as call_expression(function:
+ * await_expression(identifier), type_arguments, arguments); the callee must
+ * be unwrapped from the await_expression, not dropped. */
+TEST(extract_ts_await_generic_call) {
+    CBMFileResult *r = extract("export async function listAdminCategories() {\n"
+                               "  const rows = await authedGet<Row[]>('/api/admin/categories')\n"
+                               "  return rows\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "admin.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call(r, "authedGet"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Controls: the same call without generics and without await must keep
+ * extracting (regression guard for the unwrap). */
+TEST(extract_ts_await_generic_call_controls) {
+    CBMFileResult *r = extract("export async function a() { return await g('/x') }\n"
+                               "export function b() { return g<T>('/x') }\n"
+                               "export function c() { return (g)('/x') }\n",
+                               CBM_LANG_TYPESCRIPT, "t", "ctrl.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int g_calls = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (strcmp(r->calls.items[i].callee_name, "g") == 0) {
+            g_calls++;
+        }
+    }
+    ASSERT_GTE(g_calls, 3);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- C/C++ preprocessor macros become Macro nodes (#375) --- */
 TEST(extract_c_macros_issue375) {
     CBMFileResult *r = extract("#define SIMPLE_MACRO 1\n"
@@ -3035,6 +3072,8 @@ SUITE(extraction) {
     RUN_TEST(extract_r_box_use_imports_issue218);
     RUN_TEST(extract_r_dollar_call_issue219);
     RUN_TEST(extract_ts_factory_object_methods_issue341);
+    RUN_TEST(extract_ts_await_generic_call);
+    RUN_TEST(extract_ts_await_generic_call_controls);
     RUN_TEST(extract_c_macros_issue375);
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_gdscript_issue186);

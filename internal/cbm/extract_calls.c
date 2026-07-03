@@ -243,6 +243,18 @@ static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *so
     TSNode func_node = ts_node_child_by_field_name(node, TS_FIELD("function"));
     if (!ts_node_is_null(func_node)) {
         const char *fk = ts_node_type(func_node);
+        // TS/JS: `await g<T>(x)` parses as call_expression(function:
+        // await_expression(identifier), type_arguments, arguments); `(g)(x)`
+        // and `g!(x)` wrap the callee the same way. Unwrap one level to the
+        // named child so the callee is classified normally instead of dropped.
+        if (strcmp(fk, "await_expression") == 0 || strcmp(fk, "parenthesized_expression") == 0 ||
+            strcmp(fk, "non_null_expression") == 0) {
+            TSNode inner = ts_node_named_child(func_node, 0);
+            if (!ts_node_is_null(inner)) {
+                func_node = inner;
+                fk = ts_node_type(func_node);
+            }
+        }
         if (strcmp(fk, "selector_expression") == 0) {
             return resolve_chained_selector(a, func_node, source);
         }
