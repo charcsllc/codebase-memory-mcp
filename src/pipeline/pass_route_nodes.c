@@ -1190,6 +1190,231 @@ static void create_sveltekit_routes(cbm_gbuf_t *gb) {
     }
 }
 
+/* ── Next.js App Router routes ─────────────────────────────────────
+ *
+ * Filesystem convention mirroring the SvelteKit block above:
+ * route modules named route.{ts,js,tsx,jsx} under the app tree export HTTP verb
+ * handlers (GET/POST/PUT/PATCH/DELETE/OPTIONS/HEAD).
+ *
+ *   frontend/src/app/api/cart/route.ts        → /api/cart
+ *   .../app/api/products/[id]/route.ts        → /api/products/:id
+ *   .../app/(shop)/api/cart/route.ts          → /api/cart      (group stripped)
+ *   .../app/api/docs/[...slug]/route.ts       → /api/docs/:slug (catch-all)
+ *   '@slot' segments are URL-neutral (parallel routes) and are skipped;
+ *   a '_private' segment opts the whole subtree out of routing.
+ *
+ * Every param flavour is emitted as ':name' so cbm_route_canon_path
+ * collapses it to the same '{}' token the server-framework routes use —
+ * the QN rendezvous depends on that. */
+
+/* True when file_path is an App Router route module. Sets *seg_start to
+ * the first char after the "app/" segment. Requires a path segment named
+ * exactly "app" before the basename so unrelated files named route.ts
+ * don't match. */
+static int nextjs_route_file(const char *file_path, const char **seg_start) {
+    if (!file_path) {
+        return 0;
+    }
+    const char *slash = strrchr(file_path, '/');
+    const char *base = slash ? slash + 1 : file_path;
+    if (strcmp(base, "route.ts") != 0 && strcmp(base, "route.js") != 0 &&
+        strcmp(base, "route.tsx") != 0 && strcmp(base, "route.jsx") != 0) {
+        return 0;
+    }
+    const char *p = file_path;
+    while (p && *p) {
+        const char *seg_end = strchr(p, '/');
+        size_t len = seg_end ? (size_t)(seg_end - p) : strlen(p);
+        if (len == strlen("app") && strncmp(p, "app", strlen("app")) == 0 && seg_end) {
+            *seg_start = seg_end + 1;
+            return (*seg_start <= base) ? 1 : 0;
+        }
+        if (!seg_end) {
+            break;
+        }
+        p = seg_end + 1;
+    }
+    return 0;
+}
+
+/* Compute the URL path for an App Router route module. Returns NULL for
+ * files under a '_private' segment (opted out of routing). */
+static const char *nextjs_route_path(const char *seg_start, const char *file_path, char *out,
+                                     int outsz) {
+    if (!seg_start || !out || outsz <= 1) {
+        return NULL;
+    }
+    const char *last_slash = strrchr(file_path, '/');
+    if (!last_slash || last_slash < seg_start) {
+        out[0] = '/';
+        out[1] = '\0';
+        return out;
+    }
+    int pos = 0;
+    out[pos] = '\0';
+    const char *p = seg_start;
+    while (p < last_slash) {
+        const char *seg_end = strchr(p, '/');
+        if (!seg_end || seg_end > last_slash) {
+            seg_end = last_slash;
+        }
+        size_t seg_len = (size_t)(seg_end - p);
+        if (seg_len > 0) {
+            if (p[0] == '(' && p[seg_len - 1] == ')') { /* route group */
+                p = seg_end + 1;
+                continue;
+            }
+            if (p[0] == '@') { /* parallel-route slot: URL-neutral */
+                p = seg_end + 1;
+                continue;
+            }
+            if (p[0] == '_') { /* private folder: not routable */
+                return NULL;
+            }
+            if (pos + 1 < outsz - 1) {
+                out[pos++] = '/';
+            }
+            if (seg_len >= 2 && p[0] == '[' && p[seg_len - 1] == ']') {
+                const char *inner = p + 1;
+                size_t inner_len = seg_len - 2;
+                /* optional catch-all [[...slug]] */
+                if (inner_len >= 2 && inner[0] == '[' && inner[inner_len - 1] == ']') {
+                    inner++;
+                    inner_len -= 2;
+                }
+                if (inner_len >= 3 && strncmp(inner, "...", 3) == 0) {
+                    inner += 3;
+                    inner_len -= 3;
+                }
+                if (pos < outsz - 1) {
+                    out[pos++] = ':';
+                }
+                size_t copy_len = inner_len;
+                if ((int)copy_len > outsz - 1 - pos) {
+                    copy_len = (size_t)(outsz - 1 - pos);
+                }
+                memcpy(out + pos, inner, copy_len);
+                pos += (int)copy_len;
+            } else {
+                size_t copy_len = seg_len;
+                if ((int)copy_len > outsz - 1 - pos) {
+                    copy_len = (size_t)(outsz - 1 - pos);
+                }
+                memcpy(out + pos, p, copy_len);
+                pos += (int)copy_len;
+            }
+            out[pos] = '\0';
+        }
+        p = seg_end + 1;
+    }
+    if (pos == 0) {
+        out[pos++] = '/';
+        out[pos] = '\0';
+    }
+    return out;
+}
+
+/* HTTP verb exports of an App Router route module. Unlike SvelteKit there
+ * is no 'fallback' export. */
+static const char *nextjs_export_method(const char *name) {
+    if (!name) {
+        return NULL;
+    }
+    static const char *const verbs[] = {
+        "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD",
+    };
+    for (size_t i = 0; i < sizeof(verbs) / sizeof(verbs[0]); i++) {
+        if (strcmp(name, verbs[i]) == 0) {
+            return verbs[i];
+        }
+    }
+    return NULL;
+}
+
+typedef struct {
+    cbm_gbuf_t *gb;
+    int routes_created;
+    int handles_created;
+    int files_seen;
+} nextjs_ctx_t;
+
+static void nextjs_file_visitor(const cbm_gbuf_node_t *node, void *userdata) {
+    nextjs_ctx_t *ctx = (nextjs_ctx_t *)userdata;
+    if (!node || !node->label || strcmp(node->label, "File") != 0) {
+        return;
+    }
+    const char *seg_start = NULL;
+    if (!nextjs_route_file(node->file_path, &seg_start)) {
+        return;
+    }
+    ctx->files_seen++;
+
+    char route_path[SKR_PATH_BUF];
+    if (!nextjs_route_path(seg_start, node->file_path, route_path, sizeof(route_path))) {
+        return;
+    }
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(ctx->gb, node->id, "DEFINES", &edges, &edge_count) !=
+            0 ||
+        edge_count == 0) {
+        return;
+    }
+
+    for (int i = 0; i < edge_count; i++) {
+        const cbm_gbuf_node_t *child = cbm_gbuf_find_by_id(ctx->gb, edges[i]->target_id);
+        if (!child || !child->name || !child->label) {
+            continue;
+        }
+        /* `export const GET = async () => {}` extracts as a Variable. */
+        if (strcmp(child->label, "Function") != 0 && strcmp(child->label, "Variable") != 0) {
+            continue;
+        }
+        const char *method = nextjs_export_method(child->name);
+        if (!method) {
+            continue;
+        }
+
+        char route_qn[CBM_ROUTE_QN_SIZE];
+        char cpath[CBM_SZ_256];
+        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method,
+                 cbm_route_canon_path(route_path, cpath, sizeof(cpath)));
+        char route_props[CBM_SZ_256];
+        snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\",\"framework\":\"nextjs\"}",
+                 method);
+        int64_t route_id =
+            cbm_gbuf_upsert_node(ctx->gb, "Route", route_path, route_qn, "", 0, 0, route_props);
+        if (route_id == 0) {
+            continue;
+        }
+        ctx->routes_created++;
+
+        char hprops[CBM_SZ_256];
+        snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"framework\":\"nextjs\"}",
+                 child->qualified_name ? child->qualified_name : child->name);
+        cbm_gbuf_insert_edge(ctx->gb, child->id, route_id, "HANDLES", hprops);
+        ctx->handles_created++;
+    }
+}
+
+static void create_nextjs_routes(cbm_gbuf_t *gb) {
+    if (!gb) {
+        return;
+    }
+    nextjs_ctx_t ctx = {.gb = gb, .routes_created = 0, .handles_created = 0, .files_seen = 0};
+    cbm_gbuf_foreach_node(gb, nextjs_file_visitor, &ctx);
+    if (ctx.files_seen > 0) {
+        char b1[CBM_SZ_16];
+        char b2[CBM_SZ_16];
+        char b3[CBM_SZ_16];
+        snprintf(b1, sizeof(b1), "%d", ctx.files_seen);
+        snprintf(b2, sizeof(b2), "%d", ctx.routes_created);
+        snprintf(b3, sizeof(b3), "%d", ctx.handles_created);
+        cbm_log_info("pass.nextjs_routes", "files", b1, "routes", b2, "handles", b3);
+    }
+}
+
 void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
     if (!gb) {
         return;
@@ -1215,6 +1440,11 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
 
     /* Phase 2b: match infra Routes to handler Routes by URL path */
     match_infra_routes(gb);
+
+    /* Phase 2c: filesystem-based Next.js App Router routes. Runs BEFORE
+     * data flows (unlike SvelteKit's phase 5) so BFF handlers join the
+     * flow graph. */
+    create_nextjs_routes(gb);
 
     /* Phase 3: create DATA_FLOWS edges through Routes */
     create_data_flows(gb);

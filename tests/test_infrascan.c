@@ -112,8 +112,80 @@ TEST(infrascan_http_calls_join_matching_handler_route) {
     PASS();
 }
 
+static int has_handles_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, source_id, "HANDLES", &edges, &count);
+    for (int i = 0; i < count; i++) {
+        if (edges[i]->target_id == target_id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* D6: Next.js App Router — route.ts files under the app tree exporting verb
+ * handlers must produce Route nodes whose canon matches the server
+ * framework's ([id] → {}) plus HANDLES edges from the handler Functions. */
+TEST(infrascan_nextjs_app_router_route_nodes) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/cbm_nextjs_routes");
+    ASSERT_NOT_NULL(gb);
+
+    const char *rts = "frontend/src/app/api/x/[id]/route.ts";
+    int64_t file = cbm_gbuf_upsert_node(gb, "File", "route.ts", "test.app.api.x.id.route", rts, 0,
+                                        0, "{}");
+    int64_t get_fn =
+        cbm_gbuf_upsert_node(gb, "Function", "GET", "test.app.api.x.id.route.GET", rts, 3, 9, "{}");
+    int64_t del_fn = cbm_gbuf_upsert_node(gb, "Function", "DELETE", "test.app.api.x.id.route.DELETE",
+                                          rts, 11, 15, "{}");
+    int64_t helper = cbm_gbuf_upsert_node(gb, "Function", "buildPayload",
+                                          "test.app.api.x.id.route.buildPayload", rts, 17, 19, "{}");
+    ASSERT_GT(file, 0);
+    cbm_gbuf_insert_edge(gb, file, get_fn, "DEFINES", "{}");
+    cbm_gbuf_insert_edge(gb, file, del_fn, "DEFINES", "{}");
+    cbm_gbuf_insert_edge(gb, file, helper, "DEFINES", "{}");
+
+    /* Route group "(shop)" segments vanish from the URL. */
+    const char *grp = "frontend/src/app/(shop)/api/cart/route.ts";
+    int64_t gfile =
+        cbm_gbuf_upsert_node(gb, "File", "route.ts", "test.app.shop.api.cart.route", grp, 0, 0, "{}");
+    int64_t gpost = cbm_gbuf_upsert_node(gb, "Function", "POST", "test.app.shop.api.cart.route.POST",
+                                         grp, 1, 5, "{}");
+    cbm_gbuf_insert_edge(gb, gfile, gpost, "DEFINES", "{}");
+
+    /* _private folders are opted out of routing entirely. */
+    const char *priv = "frontend/src/app/_lib/api/route.ts";
+    int64_t pfile =
+        cbm_gbuf_upsert_node(gb, "File", "route.ts", "test.app.lib.api.route", priv, 0, 0, "{}");
+    int64_t pget = cbm_gbuf_upsert_node(gb, "Function", "GET", "test.app.lib.api.route.GET", priv,
+                                        1, 3, "{}");
+    cbm_gbuf_insert_edge(gb, pfile, pget, "DEFINES", "{}");
+
+    cbm_pipeline_create_route_nodes(gb);
+
+    const cbm_gbuf_node_t *route_get = cbm_gbuf_find_by_qn(gb, "__route__GET__/api/x/{}");
+    const cbm_gbuf_node_t *route_del = cbm_gbuf_find_by_qn(gb, "__route__DELETE__/api/x/{}");
+    const cbm_gbuf_node_t *route_cart = cbm_gbuf_find_by_qn(gb, "__route__POST__/api/cart");
+    ASSERT_NOT_NULL(route_get);
+    ASSERT_NOT_NULL(route_del);
+    ASSERT_NOT_NULL(route_cart);
+    ASSERT_TRUE(has_handles_edge(gb, get_fn, route_get->id));
+    ASSERT_TRUE(has_handles_edge(gb, del_fn, route_del->id));
+    ASSERT_TRUE(has_handles_edge(gb, gpost, route_cart->id));
+
+    /* Non-verb exports and _private files create nothing. */
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "__route__ANY__/api/x/{}"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "__route__GET__/api"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "__route__GET__/_lib/api"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "__route__GET__/lib/api"));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 SUITE(infrascan) {
     RUN_TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths);
     RUN_TEST(infrascan_route_nodes_skip_bad_http_url_paths);
     RUN_TEST(infrascan_http_calls_join_matching_handler_route);
+    RUN_TEST(infrascan_nextjs_app_router_route_nodes);
 }
