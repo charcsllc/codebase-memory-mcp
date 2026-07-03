@@ -3389,26 +3389,36 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
                 tmpfile, filelist, sm);
         }
     } else {
+        /* Mirror the POSIX sensitive-file exclusions (see below): the
+         * recursive fallback bypasses the discovery-time filter. */
+        const char *psx = "-Exclude '.env','.env.*','*.pem','*.key','id_rsa*','id_ed25519*',"
+                          "'credentials*','*service_account*.json' ";
         if (file_pattern) {
             snprintf(
                 cmd, cmd_sz,
-                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' -File "
+                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' %s-File "
                 "-ErrorAction SilentlyContinue"
                 " | Select-String -Pattern (Get-Content '%s')%s -ErrorAction SilentlyContinue"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, file_pattern, tmpfile, sm);
+                root_path, file_pattern, psx, tmpfile, sm);
         } else {
             snprintf(
                 cmd, cmd_sz,
-                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -File -ErrorAction "
+                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' %s-File -ErrorAction "
                 "SilentlyContinue"
                 " | Select-String -Pattern (Get-Content '%s')%s -ErrorAction SilentlyContinue"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, tmpfile, sm);
+                root_path, psx, tmpfile, sm);
         }
     }
 #else
     const char *flag = use_regex ? "-E" : "-F";
+    /* The recursive fallback bypasses the indexed file list (which already
+     * excludes sensitive files at discovery), so it must blind itself to
+     * secret-bearing files explicitly. Mirrors discover.c's sensitive set. */
+    const char *sens = " --exclude='.env' --exclude='.env.*' --exclude='*.pem' --exclude='*.key'"
+                       " --exclude='id_rsa*' --exclude='id_ed25519*' --exclude='credentials*'"
+                       " --exclude='*service_account*.json'";
     if (scoped) {
         if (file_pattern) {
             snprintf(cmd, cmd_sz, "xargs grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
@@ -3419,10 +3429,11 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
         }
     } else {
         if (file_pattern) {
-            snprintf(cmd, cmd_sz, "grep -rn %s --include='%s' -f '%s' '%s' 2>/dev/null", flag,
-                     file_pattern, tmpfile, root_path);
+            snprintf(cmd, cmd_sz, "grep -rn %s --include='%s'%s -f '%s' '%s' 2>/dev/null", flag,
+                     file_pattern, sens, tmpfile, root_path);
         } else {
-            snprintf(cmd, cmd_sz, "grep -rn %s -f '%s' '%s' 2>/dev/null", flag, tmpfile, root_path);
+            snprintf(cmd, cmd_sz, "grep -rn %s%s -f '%s' '%s' 2>/dev/null", flag, sens, tmpfile,
+                     root_path);
         }
     }
 #endif

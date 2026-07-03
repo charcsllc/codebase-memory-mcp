@@ -556,6 +556,62 @@ TEST(discover_cbmignore_negates_global_ignore) {
     PASS();
 }
 
+/* Secret-bearing files (.env variants, private keys, credentials) must be
+ * excluded from discovery in EVERY mode — even when git-tracked — since the
+ * index and search_code would otherwise expose their contents. Templates
+ * (.env.example/.env.sample) stay indexable. */
+TEST(discover_excludes_sensitive_files_by_default) {
+    char *base = th_mktempdir("cbm_disc_secrets");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, ".env"), "DATABASE_URL=postgres://u:pw@h/db\n");
+    th_write_file(TH_PATH(base, "backend/.env.production"), "SECRET=hunter2\n");
+    th_write_file(TH_PATH(base, ".env.example"), "DATABASE_URL=\n");
+    th_write_file(TH_PATH(base, "id_rsa"), "-----BEGIN OPENSSH PRIVATE KEY-----\n");
+    th_write_file(TH_PATH(base, "certs/cert.pem"), "-----BEGIN CERTIFICATE-----\n");
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+
+    cbm_discover_opts_t opts = {0}; /* mode 0 == CBM_MODE_FULL (default) */
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "src/main.go"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, ".env.example"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, ".env"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "backend/.env.production"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "id_rsa"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "certs/cert.pem"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* A '!' negation in .cbmignore re-includes a sensitive default, mirroring the
+ * existing precedent where cbmignore negation overrides the global ignore. */
+TEST(discover_cbmignore_reincludes_sensitive_file) {
+    char *base = th_mktempdir("cbm_disc_secrets_neg");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, ".cbmignore"), "!.env\n");
+    th_write_file(TH_PATH(base, ".env"), "DATABASE_URL=postgres://u:pw@h/db\n");
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, ".env"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* issue #234: a directory listed in the root .gitignore (e.g. "vendor/") must
  * be excluded from discovery even when untracked — Composer/PHP projects rely
  * on this. */
@@ -1083,6 +1139,8 @@ SUITE(discover) {
     RUN_TEST(discover_simple);
     RUN_TEST(discover_skips_git_dir);
     RUN_TEST(discover_with_gitignore);
+    RUN_TEST(discover_excludes_sensitive_files_by_default);
+    RUN_TEST(discover_cbmignore_reincludes_sensitive_file);
     RUN_TEST(discover_with_global_xdg_ignore);
     RUN_TEST(discover_global_excludesfile_from_gitconfig_tilde);
     RUN_TEST(discover_repo_local_excludesfile_is_ignored);
