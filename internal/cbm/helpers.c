@@ -146,6 +146,10 @@ static const char *generic_keywords[] = {
     "def",      "fn",        "func",      "fun",    "proc",   "sub",       "method",  "async",
     "await",    "yield",     NULL};
 
+const char *cbm_anon_handler_name(CBMArena *a, TSNode fn_node) {
+    return cbm_arena_sprintf(a, "__handler_L%u", ts_node_start_point(fn_node).row + 1);
+}
+
 bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     if (!name || !name[0]) {
         return true;

@@ -1130,7 +1130,11 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
             strcmp(ak2, "anonymous_function") == 0 ||
             strcmp(ak2, "anonymous_function_creation_expression") == 0 ||
             strcmp(ak2, "lambda") == 0) {
-            best = NULL;
+            /* Inline handler: reference the synthetic def extract_func_def
+             * creates for route-handler args (same name derivation), so the
+             * HANDLES edge lands on the real handler body. It still clears
+             * any earlier reference (options/middleware must not win). */
+            best = cbm_anon_handler_name(ctx->arena, arg2);
             continue;
         }
         /* `name` = PHP bare identifier handler; string = Laravel string handler

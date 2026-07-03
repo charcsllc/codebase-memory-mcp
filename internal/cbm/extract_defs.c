@@ -1,6 +1,7 @@
 #include "cbm.h"
 #include "arena.h" // CBMArena, cbm_arena_alloc/strdup/sprintf
 #include "helpers.h"
+#include "service_patterns.h"
 #include "lang_specs.h"
 #include "foundation/constants.h"
 #include "extract_node_stack.h"
@@ -2668,15 +2669,55 @@ static char *go_receiver_type_name(CBMArena *a, TSNode recv, const char *source)
     return NULL;
 }
 
+// An anonymous arrow/function expression passed as a route-registration
+// argument (app.post('/x', opts, async () => {...})) has no name to resolve
+// but IS the route handler. Detect the position: direct argument of a call
+// whose callee suffix is a route-registration method and whose first named
+// argument is a '/'-leading string/template.
+static bool is_route_handler_arg_position(CBMExtractCtx *ctx, TSNode node) {
+    TSNode args = ts_node_parent(node);
+    if (ts_node_is_null(args) || strcmp(ts_node_type(args), "arguments") != 0) {
+        return false;
+    }
+    TSNode call = ts_node_parent(args);
+    if (ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0) {
+        return false;
+    }
+    TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(fn)) {
+        return false;
+    }
+    char *callee = cbm_node_text(ctx->arena, fn, ctx->source);
+    if (!callee || cbm_service_pattern_route_method(callee) == NULL) {
+        return false;
+    }
+    if (ts_node_named_child_count(args) == 0) {
+        return false;
+    }
+    TSNode first = ts_node_named_child(args, 0);
+    const char *fk = ts_node_type(first);
+    if (strcmp(fk, "string") != 0 && strcmp(fk, "template_string") != 0) {
+        return false;
+    }
+    char *text = cbm_node_text(ctx->arena, first, ctx->source);
+    return text && text[0] && text[1] == '/';
+}
+
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
     TSNode name_node = resolve_func_name(node, ctx->language);
-    if (ts_node_is_null(name_node)) {
-        return;
+    char *name = NULL;
+    if (!ts_node_is_null(name_node)) {
+        name = cbm_node_text(a, name_node, ctx->source);
+    } else if ((ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX ||
+                ctx->language == CBM_LANG_JAVASCRIPT) &&
+               is_route_handler_arg_position(ctx, node)) {
+        // Synthetic def so the inline handler has a node for HANDLES edges
+        // and snippets. Body calls keep their enclosing-function
+        // attribution — sources of existing CALLS edges do not move.
+        name = (char *)cbm_anon_handler_name(a, node);
     }
-
-    char *name = cbm_node_text(a, name_node, ctx->source);
     if (!name || !name[0] || strcmp(name, "function") == 0) {
         return;
     }

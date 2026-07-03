@@ -809,8 +809,8 @@ TEST(parallel_unresolved_suffix_call_route_still_created) {
 
 /* Fastify-style `app.post(path, OPTS, handler)`: the named options object
  * must NOT become the HANDLES source; the trailing handler reference must.
- * Inline arrow handlers have no node, so `app.post(path, OPTS, arrow)` must
- * produce NO HANDLES edge at all rather than one from OPTS. */
+ * Inline arrow handlers get a synthetic def (__handler_L<line>) so the
+ * route is handled by the arrow's node — never by OPTS. */
 typedef struct {
     const cbm_gbuf_t *gbuf;
     int64_t route_x_id;
@@ -892,8 +892,12 @@ TEST(parallel_route_options_object_not_handler) {
     if (c.handler_id != -1) {
         ASSERT_EQ(c.handles_to_x_from_handler, 1);
     }
-    /* /y's handler is an inline arrow with no node: no HANDLES at all. */
-    ASSERT_EQ(c.handles_to_y_total, 0);
+    /* /y's handler is an inline arrow: exactly one HANDLES edge, from its
+     * synthetic def (line 5) — never from OPTS. */
+    ASSERT_EQ(c.handles_to_y_total, 1);
+    const cbm_gbuf_node_t *anon_h =
+        cbm_gbuf_find_by_qn(gbuf, "cbm_par_optshnd.routes.__handler_L5");
+    ASSERT_NOT_NULL(anon_h);
 
     cbm_gbuf_free(gbuf);
     unlink(fpath);
@@ -1195,6 +1199,66 @@ TEST(parallel_template_url_gets_method_route) {
     PASS();
 }
 
+/* ── Debt 1: inline route handlers get a synthetic node + HANDLES ── */
+
+/* An anonymous arrow passed as the handler of a route registration has no
+ * name, so no Function node existed and the route had no HANDLES edge.
+ * A deterministic synthetic def (__handler_L<line>) restores the handler
+ * identity without re-attributing the body's calls (the enclosing named
+ * function keeps them — CALLS sources stay stable). */
+TEST(parallel_inline_route_handler_gets_node_and_handles) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_inlh_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/routes.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen routes.ts failed");
+    }
+    fprintf(f, "function namedHandler() { return 2 }\n"
+               "export function routes(app: any) {\n"
+               "  app.post('/inline', { schema: 1 }, async (req: any) => { return req })\n"
+               "  app.get('/named', namedHandler)\n"
+               "}\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"routes.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_inlh", tmpdir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_node_t *route_inline = cbm_gbuf_find_by_qn(gbuf, "__route__POST__/inline");
+    const cbm_gbuf_node_t *route_named = cbm_gbuf_find_by_qn(gbuf, "__route__GET__/named");
+    ASSERT_NOT_NULL(route_inline);
+    ASSERT_NOT_NULL(route_named);
+
+    /* The arrow starts on line 3 → synthetic def __handler_L3. */
+    const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn(gbuf, "cbm_par_inlh.routes.__handler_L3");
+    ASSERT_NOT_NULL(h);
+    ASSERT_EQ(h->start_line, 3);
+
+    d4_ctx_t c = {0};
+    c.route_x_id = route_inline->id;
+    c.route_y_id = route_named->id;
+    c.handler_id = h->id;
+    cbm_gbuf_foreach_edge(gbuf, d4_scan_handles, &c);
+    ASSERT_EQ(c.handles_to_x_total, 1);
+    ASSERT_EQ(c.handles_to_x_from_handler, 1);
+    /* Control: the named handler keeps its HANDLES. */
+    ASSERT_EQ(c.handles_to_y_total, 1);
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
@@ -1231,6 +1295,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_global_fetch_emits_http_calls);
     RUN_TEST(sequential_url_and_fetch_detection_parity);
     RUN_TEST(parallel_template_url_gets_method_route);
+    RUN_TEST(parallel_inline_route_handler_gets_node_and_handles);
 
     /* Cleanup shared state */
     parity_teardown();

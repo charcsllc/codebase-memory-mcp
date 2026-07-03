@@ -15,6 +15,13 @@ char *cbm_node_text(CBMArena *a, TSNode node, const char *source);
 // Check if a string is a language keyword (should be skipped as callee/usage).
 bool cbm_is_keyword(const char *name, CBMLanguage lang);
 
+// Deterministic name for an anonymous inline route handler (arrow/function
+// expression passed to app.get('/x', ...)): "__handler_L<line>". Shared by
+// definition extraction (creates the Function def) and handler-arg
+// extraction (returns the same name as the HANDLES ref) so both sides
+// rendezvous through the registry.
+const char *cbm_anon_handler_name(CBMArena *a, TSNode fn_node);
+
 // Classify a string literal as URL, config, or neither.
 // Returns CBM_STRREF_URL (0), CBM_STRREF_CONFIG (1), or -1 for neither.
 int cbm_classify_string(const char *str, int len);
