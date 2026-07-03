@@ -2048,6 +2048,9 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop) {
         {"qualified_name", offsetof(cbm_node_t, qualified_name)},
         {"label", offsetof(cbm_node_t, label)},
         {"file_path", offsetof(cbm_node_t, file_path)},
+        /* Common alias users reach for first — silently returning "" for it
+         * makes RETURN f.path look like missing data. */
+        {"path", offsetof(cbm_node_t, file_path)},
     };
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
         if (strcmp(prop, fields[i].key) == 0) {
@@ -2082,7 +2085,8 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
     char *out = bufs[buf_idx];
     buf_idx = (buf_idx + SKIP_ONE) % CYP_BUF_8;
 
-    if (strcmp(prop, "start_line") == 0) {
+    if (strcmp(prop, "start_line") == 0 || strcmp(prop, "line") == 0 ||
+        strcmp(prop, "line_number") == 0) {
         snprintf(out, CBM_SZ_512, "%d", n->start_line);
         return out;
     }
@@ -2126,7 +2130,8 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
             if (rv && rv[0]) {
                 snprintf(out, CBM_SZ_512, "%s", rv);
                 res = out;
-            } else if (strcmp(prop, "start_line") == 0) {
+            } else if (strcmp(prop, "start_line") == 0 || strcmp(prop, "line") == 0 ||
+                       strcmp(prop, "line_number") == 0) {
                 snprintf(out, CBM_SZ_512, "%d", full.start_line);
                 res = out;
             } else if (strcmp(prop, "end_line") == 0) {
