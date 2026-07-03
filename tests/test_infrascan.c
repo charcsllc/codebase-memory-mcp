@@ -183,9 +183,62 @@ TEST(infrascan_nextjs_app_router_route_nodes) {
     PASS();
 }
 
+static int has_edge_of_type(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id,
+                            const char *type) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, source_id, type, &edges, &count);
+    for (int i = 0; i < count; i++) {
+        if (edges[i]->target_id == target_id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* D7: a client-side ANY pseudo-route must be mapped (INFRA_MAPS) onto the
+ * server-side method route with the same canonical path, so DATA_FLOWS
+ * reach the handler. A trailing ":ident" glued to the path (querystring
+ * interpolation artifact) is trimmed for the match. */
+TEST(infrascan_any_route_maps_to_method_route) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/cbm_any_method");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t client =
+        cbm_gbuf_upsert_node(gb, "Function", "loadY", "test.client.loadY", "client.ts", 1, 3, "{}");
+    int64_t handler = cbm_gbuf_upsert_node(gb, "Function", "getY", "test.server.getY", "server.ts",
+                                           1, 3, "{}");
+    int64_t any1 = cbm_gbuf_upsert_node(gb, "Route", "/api/y", "__route__ANY__/api/y", "", 0, 0,
+                                        "{\"method\":\"ANY\"}");
+    int64_t get1 = cbm_gbuf_upsert_node(gb, "Route", "/api/y", "__route__GET__/api/y", "", 0, 0,
+                                        "{\"method\":\"GET\"}");
+    int64_t anyqs = cbm_gbuf_upsert_node(gb, "Route", "/api/z:qs", "__route__ANY__/api/z:qs", "", 0,
+                                         0, "{\"method\":\"ANY\"}");
+    int64_t getz = cbm_gbuf_upsert_node(gb, "Route", "/api/z", "__route__GET__/api/z", "", 0, 0,
+                                        "{\"method\":\"GET\"}");
+    ASSERT_GT(any1, 0);
+    cbm_gbuf_insert_edge(gb, handler, get1, "HANDLES", "{\"handler\":\"test.server.getY\"}");
+    cbm_gbuf_insert_edge(gb, handler, getz, "HANDLES", "{\"handler\":\"test.server.getY\"}");
+    cbm_gbuf_insert_edge(gb, client, any1, "HTTP_CALLS",
+                         "{\"callee\":\"fetch\",\"url_path\":\"/api/y\",\"via\":\"arg_url\"}");
+    cbm_gbuf_insert_edge(gb, client, anyqs, "HTTP_CALLS",
+                         "{\"callee\":\"fetch\",\"url_path\":\"/api/z:qs\",\"via\":\"arg_url\"}");
+
+    cbm_pipeline_create_route_nodes(gb);
+
+    ASSERT_TRUE(has_edge_of_type(gb, any1, get1, "INFRA_MAPS"));
+    ASSERT_TRUE(has_edge_of_type(gb, anyqs, getz, "INFRA_MAPS"));
+    /* The payoff: the client's data flow reaches the real handler. */
+    ASSERT_TRUE(has_data_flow(gb, client, handler));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 SUITE(infrascan) {
     RUN_TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths);
     RUN_TEST(infrascan_route_nodes_skip_bad_http_url_paths);
     RUN_TEST(infrascan_http_calls_join_matching_handler_route);
     RUN_TEST(infrascan_nextjs_app_router_route_nodes);
+    RUN_TEST(infrascan_any_route_maps_to_method_route);
 }

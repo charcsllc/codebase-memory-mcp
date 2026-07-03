@@ -1458,8 +1458,43 @@ TEST(store_impact_summary_empty) {
     PASS();
 }
 
+/* D7: a Route node whose only in-edges are HTTP_CALLS (clients) must
+ * report in_degree > 0 in search results — the degree whitelist has to
+ * count service edges, not only CALLS/USAGE/INHERITS/IMPLEMENTS. */
+TEST(store_search_degree_counts_http_calls) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "svc", "/tmp/svc");
+    cbm_node_t client = {.project = "svc",
+                         .label = "Function",
+                         .name = "loadItems",
+                         .qualified_name = "svc.client.loadItems",
+                         .file_path = "client.ts"};
+    cbm_node_t route = {.project = "svc",
+                        .label = "Route",
+                        .name = "/api/items",
+                        .qualified_name = "__route__ANY__/api/items",
+                        .file_path = ""};
+    int64_t idc = cbm_store_upsert_node(s, &client);
+    int64_t idr = cbm_store_upsert_node(s, &route);
+    cbm_edge_t e = {
+        .project = "svc", .source_id = idc, .target_id = idr, .type = "HTTP_CALLS"};
+    cbm_store_insert_edge(s, &e);
+
+    cbm_search_params_t params = {
+        .project = "svc", .label = "Route", .min_degree = -1, .max_degree = -1};
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(s, &params, &out);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(out.count, 1);
+    ASSERT_GT(out.results[0].in_degree, 0);
+    cbm_store_search_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(store_search) {
     RUN_TEST(store_search_by_label);
+    RUN_TEST(store_search_degree_counts_http_calls);
     RUN_TEST(store_search_by_name_pattern);
     RUN_TEST(store_search_empty_label_ignored);
     RUN_TEST(store_search_by_file_pattern);

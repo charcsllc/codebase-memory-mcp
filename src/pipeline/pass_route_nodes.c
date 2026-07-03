@@ -1415,6 +1415,85 @@ static void create_nextjs_routes(cbm_gbuf_t *gb) {
     }
 }
 
+/* ── ANY → method route rendezvous ─────────────────────────────────
+ *
+ * Client-side URL detection cannot know the HTTP verb, so it mints
+ * __route__ANY__<path> pseudo-routes; the server side registers
+ * __route__<METHOD>__<path>. Both share the canonical path, but the QN
+ * identity rendezvous in create_data_flows never joins them. Map each ANY
+ * route onto every same-path method route with an INFRA_MAPS edge —
+ * collect_infra_handlers already follows Route-[INFRA_MAPS]->Route-
+ * [HANDLES]->handler, so DATA_FLOWS come out for free. A trailing ':ident'
+ * glued mid-segment (querystring interpolation artifact, "/api/orders:qs")
+ * is trimmed for the match. */
+
+typedef struct {
+    cbm_gbuf_t *gb;
+    int mapped;
+} any_map_ctx_t;
+
+static int link_any_route_to_methods(any_map_ctx_t *ctx, const cbm_gbuf_node_t *node,
+                                     const char *path) {
+    static const char *const verbs[] = {
+        "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD",
+    };
+    int found = 0;
+    for (size_t i = 0; i < sizeof(verbs) / sizeof(verbs[0]); i++) {
+        char qn[CBM_ROUTE_QN_SIZE];
+        snprintf(qn, sizeof(qn), "__route__%s__%s", verbs[i], path);
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gb, qn);
+        if (!target || target->id == node->id) {
+            continue;
+        }
+        cbm_gbuf_insert_edge(ctx->gb, node->id, target->id, "INFRA_MAPS",
+                             "{\"via\":\"any_method_match\"}");
+        ctx->mapped++;
+        found++;
+    }
+    return found;
+}
+
+static void any_route_visitor(const cbm_gbuf_node_t *node, void *userdata) {
+    any_map_ctx_t *ctx = (any_map_ctx_t *)userdata;
+    if (!node || !node->label || strcmp(node->label, "Route") != 0 || !node->qualified_name) {
+        return;
+    }
+    static const char prefix[] = "__route__ANY__";
+    if (strncmp(node->qualified_name, prefix, sizeof(prefix) - 1) != 0) {
+        return;
+    }
+    const char *path = node->qualified_name + sizeof(prefix) - 1;
+    if (link_any_route_to_methods(ctx, node, path) > 0) {
+        return;
+    }
+    /* Retry once with a trailing mid-segment ':ident' trimmed. */
+    const char *colon = strrchr(path, ':');
+    if (!colon || colon == path || colon[-1] == '/' || strchr(colon, '/') != NULL) {
+        return;
+    }
+    char trimmed[CBM_SZ_512];
+    size_t len = (size_t)(colon - path);
+    if (len >= sizeof(trimmed)) {
+        return;
+    }
+    memcpy(trimmed, path, len);
+    trimmed[len] = '\0';
+    link_any_route_to_methods(ctx, node, trimmed);
+}
+
+static void link_any_routes(cbm_gbuf_t *gb) {
+    if (!gb) {
+        return;
+    }
+    any_map_ctx_t ctx = {.gb = gb, .mapped = 0};
+    cbm_gbuf_foreach_node(gb, any_route_visitor, &ctx);
+    if (ctx.mapped > 0) {
+        char buf[CBM_SZ_16];
+        snprintf(buf, sizeof(buf), "%d", ctx.mapped);
+        cbm_log_info("pass.any_route_map", "mapped", buf);
+    }
+}
+
 void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
     if (!gb) {
         return;
@@ -1443,8 +1522,13 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
 
     /* Phase 2c: filesystem-based Next.js App Router routes. Runs BEFORE
      * data flows (unlike SvelteKit's phase 5) so BFF handlers join the
-     * flow graph. */
+     * flow graph and the ANY→method rendezvous below can see them. */
     create_nextjs_routes(gb);
+
+    /* Phase 2d: map client-side ANY pseudo-routes onto server method
+     * routes sharing the canonical path (INFRA_MAPS), so create_data_flows
+     * can route HTTP_CALLS through to the real handler. */
+    link_any_routes(gb);
 
     /* Phase 3: create DATA_FLOWS edges through Routes */
     create_data_flows(gb);

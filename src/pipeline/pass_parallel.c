@@ -1367,6 +1367,14 @@ static bool normalize_url_arg(const char *url, char *norm, int norm_sz) {
     }
     while (*p && ni < norm_sz - PAIR_LEN) {
         if (*p == '$' && *(p + SKIP_ONE) == '{') {
+            /* Mid-segment interpolation ("/api/orders${qs}") is
+             * querystring-style glue: treat it like '?' and stop, so the
+             * path can match its server route instead of minting an
+             * unmatchable ':qs' glued to the last segment. Segment-start
+             * interpolation ("/api/users/${id}") stays a ':id' param. */
+            if (ni == 0 || norm[ni - SKIP_ONE] != '/') {
+                break;
+            }
             norm[ni++] = ':';
             p += PAIR_LEN;
             while (*p && *p != '}' && ni < norm_sz - PAIR_LEN) {
@@ -1417,6 +1425,78 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                  "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\"}", esc_c, esc_n);
         cbm_gbuf_insert_edge(gbuf, source->id, route_id, "HTTP_CALLS", eprops);
         break;
+    }
+}
+
+/* Exact global-fetch callee names. Deliberately NOT a service_patterns
+ * substring table entry: "fetch" as a QN substring would false-positive on
+ * fetchUser / prefetch / refetchQueries. */
+static bool is_global_fetch_callee(const char *callee) {
+    return callee &&
+           (strcmp(callee, "fetch") == 0 || strcmp(callee, "window.fetch") == 0 ||
+            strcmp(callee, "globalThis.fetch") == 0);
+}
+
+/* Infer the HTTP method from a fetch init object literal in the args
+ * ({ method: 'POST', ... }). Defaults to ANY (fetch's default is GET, but
+ * ANY lets the route rendezvous match any server verb). */
+static const char *fetch_init_method(const CBMCall *call) {
+    static const char *const verbs[] = {"POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD",
+                                        "GET"};
+    for (int ai = 0; ai < call->arg_count; ai++) {
+        const CBMCallArg *ca = &call->args[ai];
+        if (!ca->expr) {
+            continue;
+        }
+        const char *m = strstr(ca->expr, "method");
+        if (!m) {
+            continue;
+        }
+        for (size_t i = 0; i < sizeof(verbs) / sizeof(verbs[0]); i++) {
+            if (strstr(m, verbs[i]) != NULL) {
+                return verbs[i];
+            }
+        }
+    }
+    return "ANY";
+}
+
+/* Emit an HTTP_CALLS edge (plus its Route pseudo-node) for a direct call to
+ * the global fetch(). The callee resolves to nothing (browser/Node builtin,
+ * not in any library table), so emit_service_edge never classifies it — the
+ * unresolved path calls this instead. The URL argument must pass the HTTP
+ * route-literal guard to avoid false positives on non-URL strings. */
+static void emit_global_fetch_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                   const CBMCall *call) {
+    for (int ai = 0; ai < call->arg_count; ai++) {
+        const CBMCallArg *ca = &call->args[ai];
+        const char *url = ca->value ? ca->value : ca->expr;
+        if (!url || (url[0] != '/' && url[0] != '`' && url[0] != '"' && url[0] != '\'')) {
+            continue;
+        }
+        char norm[CBM_SZ_256];
+        if (!normalize_url_arg(url, norm, (int)sizeof(norm))) {
+            continue;
+        }
+        if (!cbm_service_pattern_is_http_route_literal(norm, call->callee_name)) {
+            continue;
+        }
+        const char *method = fetch_init_method(call);
+        char route_qn[CBM_ROUTE_QN_SIZE];
+        char cpath[CBM_SZ_256];
+        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method,
+                 cbm_route_canon_path(norm, cpath, sizeof(cpath)));
+        int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", norm, route_qn, "", 0, 0,
+                                                "{\"source\":\"arg_url\"}");
+        char esc_n[CBM_SZ_256];
+        cbm_json_escape(esc_n, sizeof(esc_n), norm);
+        char eprops[CBM_SZ_512];
+        snprintf(eprops, sizeof(eprops),
+                 "{\"callee\":\"fetch\",\"url_path\":\"%s\",\"method\":\"%s\","
+                 "\"via\":\"global_fetch\"}",
+                 esc_n, method);
+        cbm_gbuf_insert_edge(gbuf, source->id, route_id, "HTTP_CALLS", eprops);
+        return;
     }
 }
 
@@ -1888,6 +1968,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
 
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
+            /* Direct global fetch(): a browser/Node builtin that never
+             * resolves to a project symbol. Emit the HTTP_CALLS edge here —
+             * detect_url_in_args only runs for resolved callees. */
+            if (lang_is_js && is_global_fetch_callee(call->callee_name)) {
+                emit_global_fetch_edge(ws->local_edge_buf, source_node, call);
+                continue;
+            }
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,

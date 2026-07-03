@@ -4149,7 +4149,11 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     classify_all_grep_hits(gm, gm_count, store, project, &sr, &sr_count, &sr_cap, &raw, &raw_count,
                            &raw_cap);
 
-    /* Phase 3: batch degree query — ONE query for all results instead of 2×N */
+    /* Phase 3: batch degree query — ONE query for all results instead of 2×N.
+     * Deliberately CALLS-only: this feeds search_code's relevance ranking,
+     * where pure code centrality is the signal. Graph-wide degrees (incl.
+     * HTTP_CALLS/HANDLES/INFRA_MAPS) live in cbm_store_search /
+     * cbm_store_node_degree instead. */
     if (store && sr_count > 0) {
         int64_t *ids = malloc(sr_count * sizeof(int64_t));
         int *in_degs = malloc(sr_count * sizeof(int));

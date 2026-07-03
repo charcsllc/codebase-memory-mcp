@@ -1047,6 +1047,67 @@ TEST(parallel_imported_generic_name_keeps_edge) {
     PASS();
 }
 
+/* ── D7: direct global fetch() calls must emit HTTP_CALLS ─────────── */
+
+typedef struct {
+    int http_calls;
+} http_calls_ctx_t;
+
+static void count_http_calls(const cbm_gbuf_edge_t *edge, void *ud) {
+    http_calls_ctx_t *c = ud;
+    if (edge && edge->type && strcmp(edge->type, "HTTP_CALLS") == 0) {
+        c->http_calls++;
+    }
+}
+
+TEST(parallel_global_fetch_emits_http_calls) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_fetch_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/client.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen client.ts failed");
+    }
+    fprintf(f, "export async function loadX() {\n"
+               "  const r = await fetch('/api/x/items')\n"
+               "  return r\n"
+               "}\n"
+               "export async function loadY(qs: string) {\n"
+               "  return fetch(`/api/y/list${qs}`)\n"
+               "}\n"
+               "export async function createZ(body: string) {\n"
+               "  return fetch('/api/z/items', { method: 'POST', body })\n"
+               "}\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"client.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_fetch", tmpdir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    http_calls_ctx_t c = {0};
+    cbm_gbuf_foreach_edge(gbuf, count_http_calls, &c);
+    ASSERT_GTE(c.http_calls, 3);
+
+    /* Plain path → ANY; template-literal querystring is trimmed; an
+     * init object with method: 'POST' upgrades the route method. */
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__ANY__/api/x/items"));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__ANY__/api/y/list"));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__POST__/api/z/items"));
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
@@ -1080,6 +1141,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_generic_method_name_not_resolved_cross_file);
     RUN_TEST(parallel_callback_param_not_resolved_cross_file);
     RUN_TEST(parallel_imported_generic_name_keeps_edge);
+    RUN_TEST(parallel_global_fetch_emits_http_calls);
 
     /* Cleanup shared state */
     parity_teardown();

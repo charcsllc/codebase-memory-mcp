@@ -11,6 +11,8 @@
 #ifndef CBM_SERVICE_PATTERNS_H
 #define CBM_SERVICE_PATTERNS_H
 
+#include <stdbool.h>
+
 /* Edge type returned by pattern match. */
 typedef enum {
     CBM_SVC_NONE = 0,      /* Not a service pattern — use normal CALLS */
@@ -54,5 +56,11 @@ const char *cbm_service_pattern_route_method(const char *callee_name);
 /* Get the broker name for an async QN (e.g., "pubsub" from a Pub/Sub QN).
  * Returns NULL if not an async pattern. */
 const char *cbm_service_pattern_broker(const char *resolved_qn);
+
+/* True when a string literal looks like an HTTP route (leading '/' with a
+ * second path segment, or an http(s):// URL) rather than a filesystem path,
+ * config key or other non-URL string. `callee_name` refines the judgement
+ * (path-manipulation callees are rejected). */
+bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name);
 
 #endif /* CBM_SERVICE_PATTERNS_H */
