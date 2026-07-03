@@ -1860,6 +1860,33 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
 
+        /* JS/TS mirror of the Perl guard: an unresolved-receiver call to a
+         * generic prototype method (Map.get, Set.add, redis.set, ...) must
+         * not be wired to a project function sharing the name via a weak
+         * project-global strategy. High-confidence strategies (same_module,
+         * import_map*, qualified_suffix, field_type_hint, lsp_*) pass through
+         * — see cbm_js_suppress_generic_match. */
+        bool lang_is_js = (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+                           lang == CBM_LANG_JAVASCRIPT);
+        /* A resolved QN matching a service pattern (bullmq queue.add, sqs
+         * SendMessage, ...) is a strong signal the receiver guess is right —
+         * it classifies as ASYNC/HTTP_CALLS, not a noisy plain CALLS. */
+        bool svc_qn = res.qualified_name && res.qualified_name[0] &&
+                      cbm_service_pattern_match(res.qualified_name) != CBM_SVC_NONE;
+        if (!svc_qn && cbm_js_suppress_generic_match(lang_is_js, call->is_method,
+                                                     call->callee_name, res.strategy)) {
+            continue;
+        }
+
+        /* Invoking a callback PARAMETER of the enclosing function (detected
+         * at extraction — is_param_call) can never be a cross-file call to a
+         * project function sharing the name: drop weak short-name guesses. */
+        if (lang_is_js && call->is_param_call && res.strategy &&
+            (strcmp(res.strategy, "unique_name") == 0 ||
+             strcmp(res.strategy, "suffix_match") == 0)) {
+            continue;
+        }
+
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,

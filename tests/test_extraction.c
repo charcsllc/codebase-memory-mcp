@@ -3070,16 +3070,29 @@ TEST(extract_perl_method_call_flags_is_method) {
     PASS();
 }
 
-/* Other languages must be unaffected: a JS method call never sets is_method
- * (the flag is Perl-only). */
+/* TS/JS receiver calls set is_method (the callee keeps its dotted
+ * receiver); bare calls stay unflagged. Other languages are unaffected. */
 TEST(extract_non_perl_method_call_not_flagged_is_method) {
     CBMFileResult *r =
         extract("function run(o){ o.commit(); helper(); }\n", CBM_LANG_JAVASCRIPT, "t", "x.js");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     for (int i = 0; i < r->calls.count; i++) {
-        ASSERT_FALSE(r->calls.items[i].is_method);
+        if (strcmp(r->calls.items[i].callee_name, "o.commit") == 0) {
+            ASSERT_TRUE(r->calls.items[i].is_method);
+        }
+        if (strcmp(r->calls.items[i].callee_name, "helper") == 0) {
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        }
     }
+    /* Go member calls stay unflagged: the guard is Perl/TS/JS-scoped. */
+    CBMFileResult *g = extract("package main\nfunc run() { obj.Commit() }\n", CBM_LANG_GO, "t",
+                               "x.go");
+    ASSERT_NOT_NULL(g);
+    for (int i = 0; i < g->calls.count; i++) {
+        ASSERT_FALSE(g->calls.items[i].is_method);
+    }
+    cbm_free_result(g);
     cbm_free_result(r);
     PASS();
 }

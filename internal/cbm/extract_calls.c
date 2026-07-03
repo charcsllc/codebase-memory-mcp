@@ -1168,13 +1168,40 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
             call.loop_depth = state->loop_depth;     // enclosing loop nesting at this call
             call.branch_depth = state->branch_depth; // enclosing branch nesting at this call
             call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
-            // Perl-only: flag arrow/method calls ($obj->m / Class->m). The
-            // generic short-name resolver cannot place a method without a known
-            // receiver type, so the call-resolution pass suppresses those edges.
-            // Default false for every other language (struct is zero-init).
+            // Flag receiver calls. The generic short-name resolver cannot
+            // place a method without a known receiver type, so the
+            // call-resolution noise guards suppress weak matches for these.
+            // Perl: $obj->m / Class->m. TS/JS: the extracted callee keeps
+            // its dotted receiver ("redis.set"). Default false elsewhere
+            // (struct is zero-init).
             if (ctx->language == CBM_LANG_PERL &&
                 strcmp(ts_node_type(node), "method_call_expression") == 0) {
                 call.is_method = true;
+            }
+            if ((ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX ||
+                 ctx->language == CBM_LANG_JAVASCRIPT) &&
+                strchr(callee, '.') != NULL) {
+                call.is_method = true;
+            }
+            // A bare callee that names a PARAMETER of its enclosing function
+            // is a callback invocation — it can never resolve to another
+            // file's function. The enclosing def was pushed before its body
+            // walk, so scan defs backwards for the matching QN.
+            if (!strchr(callee, '.') && state->enclosing_func_qn) {
+                for (int di = ctx->result->defs.count - 1; di >= 0; di--) {
+                    const CBMDefinition *ed = &ctx->result->defs.items[di];
+                    if (!ed->qualified_name ||
+                        strcmp(ed->qualified_name, state->enclosing_func_qn) != 0) {
+                        continue;
+                    }
+                    for (const char **pn = ed->param_names; pn && *pn; pn++) {
+                        if (strcmp(*pn, callee) == 0) {
+                            call.is_param_call = true;
+                            break;
+                        }
+                    }
+                    break;
+                }
             }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));

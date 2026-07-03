@@ -901,6 +901,152 @@ TEST(parallel_route_options_object_not_handler) {
     PASS();
 }
 
+/* ── D2: bare-name resolution must not invent cross-file member calls ── */
+
+typedef struct {
+    int64_t target_id;
+    int count;
+} calls_to_id_ctx_t;
+
+static void count_calls_to_id(const cbm_gbuf_edge_t *edge, void *ud) {
+    calls_to_id_ctx_t *c = ud;
+    if (edge && edge->type && strcmp(edge->type, "CALLS") == 0 &&
+        edge->target_id == c->target_id) {
+        c->count++;
+    }
+}
+
+static int d2_write_file(const char *dir, const char *name, const char *content, char *out,
+                         size_t outsz) {
+    snprintf(out, outsz, "%s/%s", dir, name);
+    FILE *f = fopen(out, "w");
+    if (!f) {
+        return -1;
+    }
+    fputs(content, f);
+    fclose(f);
+    return 0;
+}
+
+/* `s.add(x)` where `s` is a local Set must NOT resolve to an unrelated
+ * project function that merely shares the name `add` (no import path). */
+TEST(parallel_generic_method_name_not_resolved_cross_file) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_d2a_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fa[512], fb[512];
+    ASSERT_EQ(d2_write_file(tmpdir, "a.ts",
+                            "const s = new Set<number>()\n"
+                            "export function useIt(x: number) { s.add(x) }\n",
+                            fa, sizeof(fa)),
+              0);
+    ASSERT_EQ(d2_write_file(tmpdir, "b.ts",
+                            "export function add(a: number, b: number) { return a + b }\n", fb,
+                            sizeof(fb)),
+              0);
+
+    cbm_file_info_t files[2] = {{0}, {0}};
+    files[0].path = fa;
+    files[0].rel_path = (char *)"a.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+    files[1].path = fb;
+    files[1].rel_path = (char *)"b.ts";
+    files[1].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_d2a", tmpdir, files, 2, 1);
+    ASSERT_NOT_NULL(gbuf);
+    const cbm_gbuf_node_t *add_fn = cbm_gbuf_find_by_qn(gbuf, "cbm_par_d2a.b.add");
+    ASSERT_NOT_NULL(add_fn);
+    calls_to_id_ctx_t c = {add_fn->id, 0};
+    cbm_gbuf_foreach_edge(gbuf, count_calls_to_id, &c);
+    ASSERT_EQ(c.count, 0);
+    cbm_gbuf_free(gbuf);
+    unlink(fa);
+    unlink(fb);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* A callback PARAMETER being invoked must not be wired to an unrelated
+ * project function of the same name in another file. */
+TEST(parallel_callback_param_not_resolved_cross_file) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_d2b_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char ff[512], fg[512];
+    ASSERT_EQ(d2_write_file(tmpdir, "f.ts",
+                            "export function wrap(run: () => void) { run() }\n", ff, sizeof(ff)),
+              0);
+    ASSERT_EQ(d2_write_file(tmpdir, "g.ts", "export function run() { return 1 }\n", fg,
+                            sizeof(fg)),
+              0);
+
+    cbm_file_info_t files[2] = {{0}, {0}};
+    files[0].path = ff;
+    files[0].rel_path = (char *)"f.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+    files[1].path = fg;
+    files[1].rel_path = (char *)"g.ts";
+    files[1].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_d2b", tmpdir, files, 2, 1);
+    ASSERT_NOT_NULL(gbuf);
+    const cbm_gbuf_node_t *run_fn = cbm_gbuf_find_by_qn(gbuf, "cbm_par_d2b.g.run");
+    ASSERT_NOT_NULL(run_fn);
+    calls_to_id_ctx_t c = {run_fn->id, 0};
+    cbm_gbuf_foreach_edge(gbuf, count_calls_to_id, &c);
+    ASSERT_EQ(c.count, 0);
+    cbm_gbuf_free(gbuf);
+    unlink(ff);
+    unlink(fg);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* Control: an IMPORTED function keeps its CALLS edge even when its name is
+ * in the generic-method set (import_map / lsp strategies stay intact). */
+TEST(parallel_imported_generic_name_keeps_edge) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_d2c_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fc[512], fd[512];
+    ASSERT_EQ(d2_write_file(tmpdir, "c.ts", "export function add(a: number) { return a }\n", fc,
+                            sizeof(fc)),
+              0);
+    ASSERT_EQ(d2_write_file(tmpdir, "d.ts",
+                            "import { add } from './c'\n"
+                            "export function useAdd() { return add(1) }\n",
+                            fd, sizeof(fd)),
+              0);
+
+    cbm_file_info_t files[2] = {{0}, {0}};
+    files[0].path = fc;
+    files[0].rel_path = (char *)"c.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+    files[1].path = fd;
+    files[1].rel_path = (char *)"d.ts";
+    files[1].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_d2c", tmpdir, files, 2, 1);
+    ASSERT_NOT_NULL(gbuf);
+    const cbm_gbuf_node_t *add_fn = cbm_gbuf_find_by_qn(gbuf, "cbm_par_d2c.c.add");
+    ASSERT_NOT_NULL(add_fn);
+    calls_to_id_ctx_t c = {add_fn->id, 0};
+    cbm_gbuf_foreach_edge(gbuf, count_calls_to_id, &c);
+    ASSERT_GTE(c.count, 1);
+    cbm_gbuf_free(gbuf);
+    unlink(fc);
+    unlink(fd);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
@@ -931,6 +1077,9 @@ SUITE(parallel) {
     RUN_TEST(parallel_unresolved_suffix_call_no_self_loop);
     RUN_TEST(parallel_unresolved_suffix_call_route_still_created);
     RUN_TEST(parallel_route_options_object_not_handler);
+    RUN_TEST(parallel_generic_method_name_not_resolved_cross_file);
+    RUN_TEST(parallel_callback_param_not_resolved_cross_file);
+    RUN_TEST(parallel_imported_generic_name_keeps_edge);
 
     /* Cleanup shared state */
     parity_teardown();

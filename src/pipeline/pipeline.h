@@ -184,6 +184,19 @@ bool cbm_perl_is_builtin(const char *name);
 bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *callee_name,
                                      const char *strategy);
 
+/* True if `name` is a generic JS/TS prototype/collection method name
+ * (Map.get/Set.add/Array.map/...). Used to suppress bare-name resolver noise
+ * for receiver calls whose receiver could not be resolved. */
+bool cbm_js_is_generic_method(const char *name);
+
+/* JS/TS mirror of cbm_perl_suppress_generic_match: true only for TS/JS/TSX,
+ * only for a RECEIVER call (is_method) with a generic prototype method name,
+ * and only when the match used a weak short-name strategy (unique_name /
+ * suffix_match). Every other strategy is kept. Pure; unit-tested in
+ * test_registry.c. */
+bool cbm_js_suppress_generic_match(bool is_js, bool is_method, const char *callee_name,
+                                   const char *strategy);
+
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
 

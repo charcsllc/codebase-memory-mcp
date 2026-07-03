@@ -423,6 +423,65 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
     return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
 }
 
+/* ── JS/TS generic-method guard (graph accuracy: bare-name noise) ── */
+
+/* Method names shared by the JS/TS builtin prototypes (Map/Set/Array/
+ * Promise/Object/...). A receiver call like `redis.set(k)` or `s.add(x)`
+ * whose receiver could not be resolved must NOT be wired to a project
+ * function that merely shares the method name — the by_name index is
+ * project-global and such matches are virtually always false positives
+ * (e.g. every unresolved `*.set` landing on one React setter). MUST stay
+ * sorted ASCII-ascending for bsearch. */
+static const char *const JS_GENERIC_METHODS[] = {
+    "add",     "apply",    "assign",  "at",      "bind",     "call",    "catch",     "concat",
+    "delete",  "entries",  "every",   "exec",    "fill",     "filter",  "finally",   "find",
+    "findIndex", "flat",   "flatMap", "forEach", "get",      "has",     "includes",  "indexOf",
+    "join",    "keys",     "map",     "now",     "parse",    "pop",     "push",      "reduce",
+    "reject",  "replace",  "resolve", "reverse", "set",      "shift",   "slice",     "some",
+    "sort",    "splice",   "split",   "stringify", "test",   "then",    "toString",  "trim",
+    "unshift", "values",
+};
+
+static int js_generic_cmp(const void *key, const void *elem) {
+    return strcmp((const char *)key, *(const char *const *)elem);
+}
+
+/* True if `name` is a generic JS/TS prototype/collection method name. */
+bool cbm_js_is_generic_method(const char *name) {
+    if (!name || !name[0]) {
+        return false;
+    }
+    return bsearch(name, JS_GENERIC_METHODS,
+                   sizeof(JS_GENERIC_METHODS) / sizeof(JS_GENERIC_METHODS[0]),
+                   sizeof(JS_GENERIC_METHODS[0]), js_generic_cmp) != NULL;
+}
+
+/* JS/TS mirror of cbm_perl_suppress_generic_match: drop a *resolved* call
+ * edge when a RECEIVER call (obj.m — is_method) with a generic prototype
+ * method name landed via a WEAK short-name strategy. Unlike the Perl hook,
+ * this one (a) requires BOTH is_method and a generic name — receiver calls
+ * with project-specific names (repo.updateStatusIf) always keep their edge —
+ * and (b) whitelists every high-confidence strategy including qualified_
+ * suffix, field_type_hint and lsp_* (the parallel path runs the hook on
+ * LSP-resolved edges too). Pure + side-effect-free for unit testing. */
+bool cbm_js_suppress_generic_match(bool is_js, bool is_method, const char *callee_name,
+                                   const char *strategy) {
+    if (!is_js || !is_method) {
+        return false;
+    }
+    if (!strategy || !strategy[0] || !callee_name || !callee_name[0]) {
+        return false;
+    }
+    const char *method = simple_name(callee_name);
+    if (!cbm_js_is_generic_method(method)) {
+        return false;
+    }
+    if (strcmp(strategy, "unique_name") == 0 || strcmp(strategy, "suffix_match") == 0) {
+        return true; /* weak project-global short-name guess → drop */
+    }
+    return false; /* same_module / import_map* / qualified_suffix / lsp_* / ... — keep */
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {
