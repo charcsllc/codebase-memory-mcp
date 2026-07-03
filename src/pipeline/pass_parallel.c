@@ -1631,8 +1631,15 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
     } else if (svc == CBM_SVC_TRPC) {
         emit_trpc_edge(gbuf, source, call, res);
     } else if (svc == CBM_SVC_CONFIG) {
-        emit_config_edge(gbuf, source, target, call, res, arg);
-    } else {
+        if (source->id != target->id) {
+            emit_config_edge(gbuf, source, target, call, res, arg);
+        }
+    } else if (source->id != target->id) {
+        /* The unresolved callee_suffix caller passes source as target; when a
+         * route-registration suffix match carries no '/path' (Map.get, redis
+         * .get, cookies().get, ...) the fall-through must not fabricate a
+         * self CALLS edge — resolved self-calls are already dropped by the
+         * caller, so a self pair here is always synthetic. */
         emit_normal_calls_edge(gbuf, source, target, call, res);
     }
 

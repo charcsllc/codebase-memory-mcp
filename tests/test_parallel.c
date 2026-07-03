@@ -702,6 +702,109 @@ TEST(grpc_no_phantom_route_from_plain_var_issue294) {
     PASS();
 }
 
+/* ── D1: spurious CALLS self-loops from unresolved suffix matches ── */
+
+/* An unresolved method call whose name suffix-matches a route-registration
+ * method (.get/.post/.delete/...) but whose args carry no '/path' must NOT
+ * emit a CALLS self-loop on the enclosing function. Bug: resolve_file_calls
+ * passed source_node as target for the fake "callee_suffix" resolution and
+ * emit_service_edge's no-path fall-through emitted a normal CALLS edge. */
+
+typedef struct {
+    int self_loops;
+    int total_calls;
+} self_loop_ctx_t;
+
+static void count_self_loop_calls(const cbm_gbuf_edge_t *edge, void *ud) {
+    self_loop_ctx_t *c = ud;
+    if (!edge || !edge->type || strcmp(edge->type, "CALLS") != 0) {
+        return;
+    }
+    c->total_calls++;
+    if (edge->source_id == edge->target_id) {
+        c->self_loops++;
+    }
+}
+
+TEST(parallel_unresolved_suffix_call_no_self_loop) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_selfloop_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/session.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen session.ts failed");
+    }
+    /* `redis` is never defined or imported: registry resolution fails, the
+     * ".get" suffix matches a route-registration method, and the argument
+     * is a plain identifier (no '/path'). getSession is NOT recursive. */
+    fprintf(f, "export function getSession(sid: string) {\n"
+               "  return redis.get(sid)\n"
+               "}\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"session.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_selfloop", tmpdir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    self_loop_ctx_t c = {0};
+    cbm_gbuf_foreach_edge(gbuf, count_self_loop_calls, &c);
+    ASSERT_EQ(c.self_loops, 0);
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* Paired control: a route registration WITH a '/path' arg must still create
+ * the Route node even when the receiver (app) does not resolve. */
+TEST(parallel_unresolved_suffix_call_route_still_created) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_selfroute_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/routes.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen routes.ts failed");
+    }
+    fprintf(f, "function handler() { return 1 }\n"
+               "export function routes(app: any) {\n"
+               "  app.get('/x', handler)\n"
+               "}\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"routes.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_selfroute", tmpdir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_node_t *route = cbm_gbuf_find_by_qn(gbuf, "__route__GET__/x");
+    ASSERT_NOT_NULL(route);
+
+    self_loop_ctx_t c = {0};
+    cbm_gbuf_foreach_edge(gbuf, count_self_loop_calls, &c);
+    ASSERT_EQ(c.self_loops, 0);
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
@@ -729,6 +832,8 @@ SUITE(parallel) {
     RUN_TEST(parallel_total_edges);
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);
+    RUN_TEST(parallel_unresolved_suffix_call_no_self_loop);
+    RUN_TEST(parallel_unresolved_suffix_call_route_still_created);
 
     /* Cleanup shared state */
     parity_teardown();
