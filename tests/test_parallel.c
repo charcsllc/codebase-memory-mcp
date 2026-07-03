@@ -1108,6 +1108,56 @@ TEST(parallel_global_fetch_emits_http_calls) {
     PASS();
 }
 
+/* ── Debt 2: sequential pipeline parity for URL/fetch detection ──── */
+
+/* The sequential pipeline (repos under MIN_FILES_FOR_PARALLEL) must emit
+ * the same HTTP_CALLS evidence as the parallel one: direct global fetch()
+ * calls and URL-shaped args of resolved calls. */
+TEST(sequential_url_and_fetch_detection_parity) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_seq_fetch_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/client.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen client.ts failed");
+    }
+    fprintf(f, "export async function loadX() {\n"
+               "  const r = await fetch('/api/x/items')\n"
+               "  return r\n"
+               "}\n"
+               "export async function createZ(body: string) {\n"
+               "  return fetch('/api/z/items', { method: 'POST', body })\n"
+               "}\n"
+               "function post(u: string) { return u }\n"
+               "export function callit() { return post('/api/p/items') }\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"client.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_sequential("cbm_seq_fetch", tmpdir, files, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    http_calls_ctx_t c = {0};
+    cbm_gbuf_foreach_edge(gbuf, count_http_calls, &c);
+    ASSERT_GTE(c.http_calls, 3);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__ANY__/api/x/items"));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__POST__/api/z/items"));
+    /* resolved same-module call with a URL arg → arg_url evidence */
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__ANY__/api/p/items"));
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
@@ -1142,6 +1192,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_callback_param_not_resolved_cross_file);
     RUN_TEST(parallel_imported_generic_name_keeps_edge);
     RUN_TEST(parallel_global_fetch_emits_http_calls);
+    RUN_TEST(sequential_url_and_fetch_detection_parity);
 
     /* Cleanup shared state */
     parity_teardown();
