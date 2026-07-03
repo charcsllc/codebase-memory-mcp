@@ -157,6 +157,41 @@ TEST(extract_ts_await_generic_call_controls) {
     PASS();
 }
 
+/* --- TS: template-literal URLs populate first_string_arg --- */
+/* URL-position template literals (route registrations, HTTP clients) must
+ * strip backticks and keep ${...} markers so downstream canonicalization
+ * collapses them; non-URL templates stay out of first_string_arg. */
+TEST(extract_ts_template_url_first_string_arg) {
+    CBMFileResult *r = extract("export function reg(app: any, h: any) {\n"
+                               "  app.get(`/tpl`, h)\n"
+                               "}\n"
+                               "export async function z(id: string) {\n"
+                               "  return axios.get(`/api/z/${id}`)\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "client.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int checked = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "app.get") == 0) {
+            ASSERT_NOT_NULL(c->first_string_arg);
+            ASSERT_STR_EQ(c->first_string_arg, "/tpl");
+            ASSERT_NOT_NULL(c->second_arg_name);
+            ASSERT_STR_EQ(c->second_arg_name, "h");
+            checked++;
+        }
+        if (strcmp(c->callee_name, "axios.get") == 0) {
+            ASSERT_NOT_NULL(c->first_string_arg);
+            ASSERT_STR_EQ(c->first_string_arg, "/api/z/${id}");
+            checked++;
+        }
+    }
+    ASSERT_EQ(checked, 2);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Prisma: models labeled Model; generator/datasource are not defs --- */
 TEST(extract_prisma_model_labels) {
     CBMFileResult *r = extract("generator client {\n"
@@ -3118,6 +3153,7 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_await_generic_call);
     RUN_TEST(extract_ts_await_generic_call_controls);
     RUN_TEST(extract_prisma_model_labels);
+    RUN_TEST(extract_ts_template_url_first_string_arg);
     RUN_TEST(extract_c_macros_issue375);
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_gdscript_issue186);

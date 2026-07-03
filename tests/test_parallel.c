@@ -1158,6 +1158,43 @@ TEST(sequential_url_and_fetch_detection_parity) {
     PASS();
 }
 
+/* ── Debt 4: template-literal URLs feed first_string_arg ──────────── */
+
+/* An unresolved axios.get with a template URL classifies as HTTP via the
+ * callee-suffix fallback; with the template feeding first_string_arg the
+ * edge carries the real METHOD instead of only the ANY arg_url evidence. */
+TEST(parallel_template_url_gets_method_route) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_tpl_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/client2.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen client2.ts failed");
+    }
+    fprintf(f, "export async function z(id: string) {\n"
+               "  return axios.get(`/api/z/${id}`)\n"
+               "}\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"client2.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_tpl", tmpdir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gbuf, "__route__GET__/api/z/{}"));
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
@@ -1193,6 +1230,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_imported_generic_name_keeps_edge);
     RUN_TEST(parallel_global_fetch_emits_http_calls);
     RUN_TEST(sequential_url_and_fetch_detection_parity);
+    RUN_TEST(parallel_template_url_gets_method_route);
 
     /* Cleanup shared state */
     parity_teardown();

@@ -1021,6 +1021,28 @@ static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const 
             return validated;
         }
     }
+    // TS/JS template literal in URL position (`/api/z/${id}`): strip the
+    // backticks and keep the ${...} markers — route canonicalization
+    // collapses them downstream. URL-shaped content only, so template
+    // topics/config keys don't leak into first_string_arg through this
+    // branch (is_string_like stays literal-only on purpose: its other
+    // consumers — handler strings, string dispatch — need real literals).
+    if (strcmp(ak, "template_string") == 0) {
+        char *text = cbm_node_text(ctx->arena, arg, ctx->source);
+        if (text && text[0] == '`') {
+            int len = (int)strlen(text);
+            if (len >= CBM_QUOTE_PAIR && text[len - 1] == '`') {
+                char *inner = cbm_arena_strndup(ctx->arena, text + CBM_QUOTE_OFFSET,
+                                                (size_t)(len - CBM_QUOTE_PAIR));
+                const char *validated = strip_and_validate_string_arg(ctx->arena, inner);
+                if (validated &&
+                    (validated[0] == '/' || strstr(validated, "://") != NULL)) {
+                    return validated;
+                }
+            }
+        }
+        return NULL;
+    }
     if (strcmp(ak, "identifier") == 0) {
         char *const_name = cbm_node_text(ctx->arena, arg, ctx->source);
         if (const_name) {
@@ -1096,7 +1118,6 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
      * earlier reference so no HANDLES edge is fabricated from middleware or
      * options constants. */
     const char *best = NULL;
-    bool trailing_anonymous = false;
     for (uint32_t ai = HANDLER_START_IDX; ai < nc && ai < MAX_HANDLER_SCAN; ai++) {
         TSNode arg2 = ts_node_named_child(args, ai);
         /* PHP wraps each argument in an `argument` node — unwrap to the value. */
@@ -1110,7 +1131,6 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
             strcmp(ak2, "anonymous_function_creation_expression") == 0 ||
             strcmp(ak2, "lambda") == 0) {
             best = NULL;
-            trailing_anonymous = true;
             continue;
         }
         /* `name` = PHP bare identifier handler; string = Laravel string handler
@@ -1119,7 +1139,6 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
             strcmp(ak2, "selector_expression") == 0 || strcmp(ak2, "attribute") == 0 ||
             strcmp(ak2, "field_expression") == 0 || strcmp(ak2, "name") == 0) {
             best = cbm_node_text(ctx->arena, arg2, ctx->source);
-            trailing_anonymous = false;
             continue;
         }
         if (is_string_like(ak2)) {
@@ -1127,12 +1146,11 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
                 normalize_string_handler(ctx->arena, cbm_node_text(ctx->arena, arg2, ctx->source));
             if (h && h[0]) {
                 best = h;
-                trailing_anonymous = false;
             }
         }
         /* Object/array literals (options, schema) are never handlers: skip. */
     }
-    return trailing_anonymous ? NULL : best;
+    return best;
 }
 
 // Extract JSX component refs (uppercase tags) as CALLS edges.
