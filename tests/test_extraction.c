@@ -157,6 +157,36 @@ TEST(extract_ts_await_generic_call_controls) {
     PASS();
 }
 
+/* --- Prisma: models labeled Model; generator/datasource are not defs --- */
+TEST(extract_prisma_model_labels) {
+    CBMFileResult *r = extract("generator client {\n"
+                               "  provider = \"prisma-client-js\"\n"
+                               "}\n"
+                               "datasource db {\n"
+                               "  provider = \"postgresql\"\n"
+                               "  url      = env(\"DATABASE_URL\")\n"
+                               "}\n"
+                               "model User {\n"
+                               "  id    String @id\n"
+                               "  email String @unique\n"
+                               "}\n"
+                               "enum Role {\n"
+                               "  USER\n"
+                               "  ADMIN\n"
+                               "}\n",
+                               CBM_LANG_PRISMA, "t", "schema.prisma");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_defs_with_label(r, "Model"), 1);
+    ASSERT(has_def(r, "Model", "User"));
+    ASSERT_EQ(count_defs_with_label(r, "Class"), 0);
+    /* generator/datasource blocks are connection config, not domain types. */
+    ASSERT(!has_def_any(r, "client"));
+    ASSERT(!has_def_any(r, "db"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- C/C++ preprocessor macros become Macro nodes (#375) --- */
 TEST(extract_c_macros_issue375) {
     CBMFileResult *r = extract("#define SIMPLE_MACRO 1\n"
@@ -3074,6 +3104,7 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_factory_object_methods_issue341);
     RUN_TEST(extract_ts_await_generic_call);
     RUN_TEST(extract_ts_await_generic_call_controls);
+    RUN_TEST(extract_prisma_model_labels);
     RUN_TEST(extract_c_macros_issue375);
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_gdscript_issue186);

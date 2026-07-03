@@ -1252,7 +1252,7 @@ static bool import_targetable_label(const char *label) {
         return false;
     }
     static const char *ok[] = {"Class", "Interface", "Function", "Method", "Module", "Struct",
-                               "Enum",  "Trait",     "Type",     "File",   NULL};
+                               "Enum",  "Trait",     "Type",     "File",   "Model",  NULL};
     for (const char **l = ok; *l; l++) {
         if (strcmp(*l, label) == 0) {
             return true;

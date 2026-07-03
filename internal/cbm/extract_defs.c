@@ -3244,6 +3244,12 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             label = "Interface";
         }
     }
+    // Prisma: schema models are domain data models, not OOP classes. Scoped
+    // to the Prisma grammar so class labeling elsewhere is unaffected
+    // (Prisma enum/type/view declarations keep their generic labels).
+    if (ctx->language == CBM_LANG_PRISMA && strcmp(kind, "model_declaration") == 0) {
+        label = "Model";
+    }
     // F#: a `type_definition` that has a primary constructor (`type Foo(...) =`)
     // or an `inherit` clause is an OOP class, not a plain type alias. Label it
     // "Class" so it is registered as a resolvable inheritance target (the graph
