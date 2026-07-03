@@ -2846,8 +2846,16 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
                           const cbm_node_pattern_t *target_node, binding_t *b, const char *to_var,
                           const char *rel_var, binding_t *new_bindings, int *new_count, int max_new,
                           int *match_count) {
+    /* Repeated variable: when the target variable is already bound (e.g.
+     * MATCH (a)-[:CALLS]->(a)), only edges landing on that same node match.
+     * The anonymous placeholder ("_n_t", target_node->variable == NULL) is
+     * shared across chain positions and keeps its overwrite semantics. */
+    const cbm_node_t *prev_bound = target_node->variable ? binding_get(b, to_var) : NULL;
     for (int ei = 0; ei < edge_count && *new_count < max_new; ei++) {
         int64_t tid = inbound ? edges[ei].source_id : edges[ei].target_id;
+        if (prev_bound && prev_bound->id != tid) {
+            continue;
+        }
         cbm_node_t found = {0};
         if (cbm_store_find_node_by_id(store, tid, &found) != CBM_STORE_OK) {
             continue;
@@ -2881,9 +2889,15 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
     cbm_traverse_result_t tr = {0};
     const char *dir = rel->direction ? rel->direction : "outbound";
     cbm_store_bfs(store, src->id, dir, rel->types, rel->type_count, max_depth, CBM_PERCENT, &tr);
+    /* Repeated variable: mirror process_edges — an already-bound explicit
+     * target variable constrains the reachable set to that single node. */
+    const cbm_node_t *prev_bound = target_node->variable ? binding_get(b, to_var) : NULL;
     for (int v = 0; v < tr.visited_count && *new_count < max_new; v++) {
         cbm_node_hop_t *hop = &tr.visited[v];
         if (hop->hop < rel->min_hops) {
+            continue;
+        }
+        if (prev_bound && prev_bound->id != hop->node.id) {
             continue;
         }
         if (target_node->label && !label_alt_matches(hop->node.label, target_node->label)) {
