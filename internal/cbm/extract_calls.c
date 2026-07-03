@@ -1089,6 +1089,14 @@ static const char *normalize_string_handler(CBMArena *a, const char *raw) {
 
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
     uint32_t nc = ts_node_named_child_count(args);
+    /* The handler is the LAST function-like argument: Fastify/Express place
+     * options objects and middleware before it (app.post(path, OPTS,
+     * handler)), so a first-match scan wires the options object as handler.
+     * An inline arrow/function handler has no name to resolve — it clears any
+     * earlier reference so no HANDLES edge is fabricated from middleware or
+     * options constants. */
+    const char *best = NULL;
+    bool trailing_anonymous = false;
     for (uint32_t ai = HANDLER_START_IDX; ai < nc && ai < MAX_HANDLER_SCAN; ai++) {
         TSNode arg2 = ts_node_named_child(args, ai);
         /* PHP wraps each argument in an `argument` node — unwrap to the value. */
@@ -1096,22 +1104,35 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
             arg2 = ts_node_named_child(arg2, 0);
         }
         const char *ak2 = ts_node_type(arg2);
+        if (strcmp(ak2, "arrow_function") == 0 || strcmp(ak2, "function_expression") == 0 ||
+            strcmp(ak2, "function") == 0 || strcmp(ak2, "generator_function") == 0 ||
+            strcmp(ak2, "anonymous_function") == 0 ||
+            strcmp(ak2, "anonymous_function_creation_expression") == 0 ||
+            strcmp(ak2, "lambda") == 0) {
+            best = NULL;
+            trailing_anonymous = true;
+            continue;
+        }
         /* `name` = PHP bare identifier handler; string = Laravel string handler
          * ('showUsers' or 'Controller@method'). */
         if (strcmp(ak2, "identifier") == 0 || strcmp(ak2, "member_expression") == 0 ||
             strcmp(ak2, "selector_expression") == 0 || strcmp(ak2, "attribute") == 0 ||
             strcmp(ak2, "field_expression") == 0 || strcmp(ak2, "name") == 0) {
-            return cbm_node_text(ctx->arena, arg2, ctx->source);
+            best = cbm_node_text(ctx->arena, arg2, ctx->source);
+            trailing_anonymous = false;
+            continue;
         }
         if (is_string_like(ak2)) {
             const char *h =
                 normalize_string_handler(ctx->arena, cbm_node_text(ctx->arena, arg2, ctx->source));
             if (h && h[0]) {
-                return h;
+                best = h;
+                trailing_anonymous = false;
             }
         }
+        /* Object/array literals (options, schema) are never handlers: skip. */
     }
-    return NULL;
+    return trailing_anonymous ? NULL : best;
 }
 
 // Extract JSX component refs (uppercase tags) as CALLS edges.

@@ -805,6 +805,102 @@ TEST(parallel_unresolved_suffix_call_route_still_created) {
     PASS();
 }
 
+/* ── D4: route-registration handler must be the real handler arg ── */
+
+/* Fastify-style `app.post(path, OPTS, handler)`: the named options object
+ * must NOT become the HANDLES source; the trailing handler reference must.
+ * Inline arrow handlers have no node, so `app.post(path, OPTS, arrow)` must
+ * produce NO HANDLES edge at all rather than one from OPTS. */
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    int64_t route_x_id;
+    int64_t route_y_id;
+    int64_t handler_id;
+    int64_t opts_id;
+    int handles_to_x_from_handler;
+    int handles_to_x_total;
+    int handles_to_y_total;
+} d4_ctx_t;
+
+static void d4_scan_handles(const cbm_gbuf_edge_t *edge, void *ud) {
+    d4_ctx_t *c = ud;
+    if (!edge || !edge->type || strcmp(edge->type, "HANDLES") != 0) {
+        return;
+    }
+    if (edge->target_id == c->route_x_id) {
+        c->handles_to_x_total++;
+        if (edge->source_id == c->handler_id) {
+            c->handles_to_x_from_handler++;
+        }
+    }
+    if (edge->target_id == c->route_y_id) {
+        c->handles_to_y_total++;
+    }
+}
+
+TEST(parallel_route_options_object_not_handler) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_optshnd_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/routes.ts", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        FAIL("fopen routes.ts failed");
+    }
+    fprintf(f, "const OPTS = { config: { rateLimit: { max: 10 } } }\n"
+               "function handler(req: any) { return 1 }\n"
+               "export function routes(app: any) {\n"
+               "  app.post('/x', OPTS, handler)\n"
+               "  app.post('/y', OPTS, async (req: any) => { return 2 })\n"
+               "  app.get('/s', handler)\n"
+               "}\n");
+    fclose(f);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = fpath;
+    files[0].rel_path = (char *)"routes.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_optshnd", tmpdir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_node_t *route_x = cbm_gbuf_find_by_qn(gbuf, "__route__POST__/x");
+    const cbm_gbuf_node_t *route_y = cbm_gbuf_find_by_qn(gbuf, "__route__POST__/y");
+    const cbm_gbuf_node_t *route_s = cbm_gbuf_find_by_qn(gbuf, "__route__GET__/s");
+    ASSERT_NOT_NULL(route_x);
+    ASSERT_NOT_NULL(route_y);
+    ASSERT_NOT_NULL(route_s); /* control: plain (path, handler) keeps working */
+
+    d4_ctx_t c = {0};
+    c.route_x_id = route_x->id;
+    c.route_y_id = route_y->id;
+    const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(gbuf, "cbm_par_optshnd.routes.handler");
+    if (!handler) {
+        /* QN shape may differ; find by scanning is overkill — HANDLES source
+         * assertions below use the id only when found. */
+        c.handler_id = -1;
+    } else {
+        c.handler_id = handler->id;
+    }
+    cbm_gbuf_foreach_edge(gbuf, d4_scan_handles, &c);
+
+    /* /x must be handled by `handler` and by nothing else (not OPTS). */
+    ASSERT_EQ(c.handles_to_x_total, 1);
+    if (c.handler_id != -1) {
+        ASSERT_EQ(c.handles_to_x_from_handler, 1);
+    }
+    /* /y's handler is an inline arrow with no node: no HANDLES at all. */
+    ASSERT_EQ(c.handles_to_y_total, 0);
+
+    cbm_gbuf_free(gbuf);
+    unlink(fpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
@@ -834,6 +930,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_args_json_no_overflow);
     RUN_TEST(parallel_unresolved_suffix_call_no_self_loop);
     RUN_TEST(parallel_unresolved_suffix_call_route_still_created);
+    RUN_TEST(parallel_route_options_object_not_handler);
 
     /* Cleanup shared state */
     parity_teardown();

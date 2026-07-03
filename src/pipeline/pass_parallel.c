@@ -1171,7 +1171,10 @@ static const char *find_route_path_in_args(const CBMCall *call, const char **out
     if (!found) {
         return NULL;
     }
-    /* 3. Handler: first identifier arg that's not a path/keyword */
+    /* 3. Handler: last identifier-shaped arg that's not a path/keyword.
+     * Mirrors extract_handler_arg's last-wins rule so a leading options
+     * object or middleware reference does not shadow the real handler;
+     * inline function/object literals are rejected by shape. */
     for (int ai = 0; ai < call->arg_count; ai++) {
         const CBMCallArg *ca = &call->args[ai];
         if (!ca->expr || ca->expr[0] == '/' || ca->expr[0] == '"' || ca->expr[0] == '\'') {
@@ -1181,8 +1184,17 @@ static const char *find_route_path_in_args(const CBMCall *call, const char **out
                             strcmp(ca->keyword, "name") == 0 || strcmp(ca->keyword, "tags") == 0)) {
             continue;
         }
-        *out_handler = ca->expr;
-        break;
+        bool is_ref = (ca->expr[0] == '_' || ca->expr[0] == '$' ||
+                       (ca->expr[0] >= 'a' && ca->expr[0] <= 'z') ||
+                       (ca->expr[0] >= 'A' && ca->expr[0] <= 'Z'));
+        for (const char *p = ca->expr; is_ref && *p; p++) {
+            if (*p == '(' || *p == '{' || *p == '[' || *p == '=' || *p == ' ' || *p == '\n') {
+                is_ref = false;
+            }
+        }
+        if (is_ref) {
+            *out_handler = ca->expr;
+        }
     }
     return found;
 }
