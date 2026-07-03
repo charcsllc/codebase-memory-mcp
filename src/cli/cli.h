@@ -51,6 +51,20 @@ int cbm_copy_file(const char *src, const char *dst);
  * -1 on error. Regression surface for the install --force binary-swap bug. */
 int cbm_copy_binary_to_target(const char *src, const char *dst);
 
+#ifndef _WIN32
+#include <sys/types.h>
+/* Instance discovery by EXECUTABLE IDENTITY (not process name, which the
+ * kernel truncates to 15 chars — `pgrep -x codebase-memory-mcp` matches
+ * nothing; not command line, which kills innocent mentions). Linux reads
+ * /proc/<pid>/exe (including upgraded-over " (deleted)" binaries); macOS
+ * uses libproc. Exposed as the regression surface for the installer's
+ * stop-running-servers step. */
+int cbm_list_instances_by_exe(const char *exe_name, pid_t *out, int max_out);
+/* SIGTERM every instance, wait a bounded grace period, SIGKILL stragglers.
+ * Returns the number of instances signalled. */
+int cbm_kill_instances_by_exe(const char *exe_name);
+#endif
+
 /* Replace a binary file: unlinks the existing file first (handles read-only),
  * then creates a new file with the given data and permissions.
  * Returns 0 on success, -1 on error. */

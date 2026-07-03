@@ -31,6 +31,9 @@ enum {
     CLI_IDX_1 = 1,        /* array index 1 */
     CLI_IDX_2 = 2,        /* array index 2 */
     CLI_STRTOL_BASE = 10, /* decimal base for strtol */
+    CLI_MAX_INSTANCES = 64,       /* max concurrent MCP server instances tracked */
+    CLI_KILL_GRACE_POLLS = 20,    /* liveness polls before SIGKILL escalation */
+    CLI_KILL_POLL_US = 100000,    /* 100ms between liveness polls (2s total) */
     CLI_STRTOL_HEX = 16,  /* hex base for strtol */
     CLI_BUF_2K = 2048,
     CLI_BUF_8K = 8192,
@@ -2816,7 +2819,178 @@ static int cbm_macos_adhoc_sign(const char *binary_path) {
 }
 #endif
 
-/* ── Kill other MCP server instances ──────────────────────────── */
+/* ── Kill other MCP server instances ──────────────────────────────
+ *
+ * Instances are identified by EXECUTABLE IDENTITY, never by process name
+ * or command line:
+ *  - `pgrep -x codebase-memory-mcp` can never match on Linux: the kernel
+ *    truncates the process name (comm) to 15 characters and the binary
+ *    name has 19, so exact-name matching finds nothing and installs left
+ *    old servers running forever.
+ *  - `pgrep -f` (command-line matching) is worse: it signals innocent
+ *    processes that merely mention the name (an editor, `tail -f`, the
+ *    installer's own shell).
+ * Linux resolves /proc/<pid>/exe — which also identifies servers still
+ * running an upgraded-over binary (readlink reports " (deleted)").
+ * macOS uses libproc (proc_listallpids + proc_pidpath). Other POSIX
+ * platforms keep the legacy pgrep best effort. */
+
+#ifndef _WIN32
+
+#if defined(__linux__)
+#include <dirent.h>
+
+/* True when /proc/<pid>/exe resolves to a file named `exe_name`. */
+static bool cbm_pid_runs_exe(pid_t pid, const char *exe_name) {
+    char lnk[CBM_SZ_64];
+    snprintf(lnk, sizeof(lnk), "/proc/%d/exe", (int)pid);
+    char path[CLI_BUF_1K];
+    ssize_t n = readlink(lnk, path, sizeof(path) - CLI_ELEM_SIZE);
+    if (n <= 0) {
+        return false; /* no permission (other users) or process gone */
+    }
+    path[n] = '\0';
+    /* A server still running an upgraded-over binary keeps its unlinked
+     * inode; the link target gains a " (deleted)" suffix. Still ours. */
+    static const char deleted[] = " (deleted)";
+    size_t plen = strlen(path);
+    size_t dlen = sizeof(deleted) - CLI_ELEM_SIZE;
+    if (plen > dlen && strcmp(path + plen - dlen, deleted) == 0) {
+        path[plen - dlen] = '\0';
+    }
+    const char *base = strrchr(path, '/');
+    base = base ? base + CLI_ELEM_SIZE : path;
+    return strcmp(base, exe_name) == 0;
+}
+
+int cbm_list_instances_by_exe(const char *exe_name, pid_t *out, int max_out) {
+    if (!exe_name || !exe_name[0] || !out || max_out <= 0) {
+        return 0;
+    }
+    DIR *proc = opendir("/proc");
+    if (!proc) {
+        return 0;
+    }
+    pid_t self = getpid();
+    int count = 0;
+    struct dirent *ent = NULL;
+    while ((ent = readdir(proc)) != NULL && count < max_out) {
+        char *end = NULL;
+        long pid = strtol(ent->d_name, &end, CLI_STRTOL_BASE);
+        if (pid <= 0 || !end || *end != '\0' || (pid_t)pid == self) {
+            continue;
+        }
+        if (cbm_pid_runs_exe((pid_t)pid, exe_name)) {
+            out[count++] = (pid_t)pid;
+        }
+    }
+    closedir(proc);
+    return count;
+}
+
+#elif defined(__APPLE__)
+#include <libproc.h>
+
+int cbm_list_instances_by_exe(const char *exe_name, pid_t *out, int max_out) {
+    if (!exe_name || !exe_name[0] || !out || max_out <= 0) {
+        return 0;
+    }
+    int bytes = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
+    if (bytes <= 0) {
+        return 0;
+    }
+    pid_t *pids = malloc((size_t)bytes);
+    if (!pids) {
+        return 0;
+    }
+    int got = proc_listpids(PROC_ALL_PIDS, 0, pids, bytes);
+    int npids = got / (int)sizeof(pid_t);
+    pid_t self = getpid();
+    int count = 0;
+    for (int i = 0; i < npids && count < max_out; i++) {
+        if (pids[i] <= 0 || pids[i] == self) {
+            continue;
+        }
+        char path[PROC_PIDPATHINFO_MAXSIZE];
+        if (proc_pidpath(pids[i], path, sizeof(path)) <= 0) {
+            continue;
+        }
+        const char *base = strrchr(path, '/');
+        base = base ? base + CLI_ELEM_SIZE : path;
+        if (strcmp(base, exe_name) == 0) {
+            out[count++] = pids[i];
+        }
+    }
+    free(pids);
+    return count;
+}
+
+#else /* other POSIX: no reliable exact-exe API — legacy pgrep best effort */
+
+int cbm_list_instances_by_exe(const char *exe_name, pid_t *out, int max_out) {
+    if (!exe_name || !exe_name[0] || !out || max_out <= 0) {
+        return 0;
+    }
+    char cmd[CLI_BUF_256];
+    snprintf(cmd, sizeof(cmd), "pgrep -x '%s'", exe_name);
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return 0;
+    }
+    pid_t self = getpid();
+    int count = 0;
+    char line[CLI_BUF_32];
+    while (fgets(line, sizeof(line), fp) && count < max_out) {
+        pid_t pid = (pid_t)strtol(line, NULL, CLI_STRTOL_BASE);
+        if (pid > 0 && pid != self) {
+            out[count++] = pid;
+        }
+    }
+    cbm_pclose(fp);
+    return count;
+}
+
+#endif /* platform dispatch */
+
+int cbm_kill_instances_by_exe(const char *exe_name) {
+    pid_t pids[CLI_MAX_INSTANCES];
+    int n = cbm_list_instances_by_exe(exe_name, pids, CLI_MAX_INSTANCES);
+    int killed = 0;
+    for (int i = 0; i < n; i++) {
+        if (kill(pids[i], SIGTERM) == 0) {
+            killed++;
+        } else {
+            pids[i] = 0; /* already gone or not ours (EPERM) — stop tracking */
+        }
+    }
+    if (killed == 0) {
+        return 0;
+    }
+    /* Bounded grace: let servers shut down cleanly (WAL checkpoints, config
+     * writes), then make sure none survives — a hung instance would keep
+     * serving the old binary forever. kill(pid, 0) probes liveness. */
+    for (int poll = 0; poll < CLI_KILL_GRACE_POLLS; poll++) {
+        bool alive = false;
+        for (int i = 0; i < n; i++) {
+            if (pids[i] > 0 && kill(pids[i], 0) == 0) {
+                alive = true;
+                break;
+            }
+        }
+        if (!alive) {
+            break;
+        }
+        cbm_usleep(CLI_KILL_POLL_US);
+    }
+    for (int i = 0; i < n; i++) {
+        if (pids[i] > 0 && kill(pids[i], 0) == 0) {
+            (void)kill(pids[i], SIGKILL);
+        }
+    }
+    return killed;
+}
+
+#endif /* !_WIN32 */
 
 static int cbm_kill_other_instances(void) {
 #ifdef _WIN32
@@ -2829,23 +3003,7 @@ static int cbm_kill_other_instances(void) {
     (void)cbm_exec_no_shell(argv);
     return 0;
 #else
-    int killed = 0;
-    pid_t self = getpid();
-    FILE *fp = cbm_popen("pgrep -x codebase-memory-mcp", "r");
-    if (!fp) {
-        return 0;
-    }
-    char line[CLI_BUF_32];
-    while (fgets(line, sizeof(line), fp)) {
-        pid_t pid = (pid_t)strtol(line, NULL, CLI_STRTOL_BASE);
-        if (pid > 0 && pid != self) {
-            if (kill(pid, SIGTERM) == 0) {
-                killed++;
-            }
-        }
-    }
-    cbm_pclose(fp);
-    return killed;
+    return cbm_kill_instances_by_exe("codebase-memory-mcp");
 #endif
 }
 

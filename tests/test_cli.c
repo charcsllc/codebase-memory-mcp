@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 #include <unistd.h>
 #include <errno.h>
 #include <zlib.h>
@@ -1096,6 +1099,77 @@ TEST(cli_install_replaces_busy_binary) {
     test_rmdir_r(tmpdir);
     PASS();
 }
+
+#ifndef _WIN32
+/* Instance discovery must identify processes by EXECUTABLE IDENTITY, not by
+ * process name: the kernel truncates comm to 15 chars, so
+ * `pgrep -x codebase-memory-mcp` (19 chars) matches nothing on Linux and
+ * installs never stopped running servers (empirical red: both live install
+ * runs printed pgrep's truncation warning and no "Stopped N instance(s)").
+ * Command-line matching would be worse — it kills innocent processes that
+ * merely mention the name. Spawn a real process from a >15-char basename
+ * and verify the exe-identity finder sees it and the killer stops it. */
+TEST(cli_find_and_kill_instances_by_exe) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-instances-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    /* Unique >15-char basename so the test can never touch a real server. */
+    char inst_name[128];
+    snprintf(inst_name, sizeof(inst_name), "cbm-inst-probe-%d", (int)getpid());
+    char exe[512];
+    snprintf(exe, sizeof(exe), "%s/%s", tmpdir, inst_name);
+    /* Copy a SHELL, not a coreutils tool: on uutils systems /bin/sleep is a
+     * multicall binary that dispatches on the executable basename and would
+     * refuse to run under our unique name. A copied sh keeps its identity. */
+    ASSERT_EQ(cbm_copy_file("/bin/sh", exe), 0);
+    chmod(exe, 0755);
+
+    pid_t child = fork();
+    if (child == 0) {
+        execl(exe, inst_name, "-c", "while :; do sleep 1; done", (char *)NULL);
+        _exit(127);
+    }
+    ASSERT_GT((int)child, 0);
+    cbm_usleep(200 * 1000); /* let the child reach exec */
+
+#ifdef __linux__
+    /* Root cause on record: exact-name pgrep cannot see the process. */
+    char pgrep_cmd[256];
+    snprintf(pgrep_cmd, sizeof(pgrep_cmd), "pgrep -x %s 2>/dev/null", inst_name);
+    FILE *pg = popen(pgrep_cmd, "r");
+    ASSERT_NOT_NULL(pg);
+    char pgline[64] = {0};
+    char *got = fgets(pgline, sizeof(pgline), pg);
+    pclose(pg);
+    ASSERT_NULL(got); /* 19-char name > 15-char comm -> zero matches */
+#endif
+
+    /* The exe-identity finder DOES see it. */
+    pid_t pids[8];
+    int n = cbm_list_instances_by_exe(inst_name, pids, 8);
+    ASSERT_GTE(n, 1);
+    bool found = false;
+    for (int i = 0; i < n; i++) {
+        if (pids[i] == child) {
+            found = true;
+        }
+    }
+    ASSERT_TRUE(found);
+
+    /* And the killer stops it (SIGTERM, bounded grace, SIGKILL fallback). */
+    int killed = cbm_kill_instances_by_exe(inst_name);
+    ASSERT_GTE(killed, 1);
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFSIGNALED(status));
+
+    unlink(exe);
+    rmdir(tmpdir);
+    PASS();
+}
+#endif /* !_WIN32 */
 
 /* #472: copying the running binary onto itself must NOT truncate it. */
 TEST(cli_install_same_file_guard_issue472) {
@@ -2763,6 +2837,9 @@ SUITE(cli) {
     /* Binary swap on install --force (#472) */
     RUN_TEST(cli_install_copies_binary_to_target_issue472);
     RUN_TEST(cli_install_replaces_busy_binary);
+#ifndef _WIN32
+    RUN_TEST(cli_find_and_kill_instances_by_exe);
+#endif
     RUN_TEST(cli_install_same_file_guard_issue472);
 
     /* YAML parser (7 unit tests) */
