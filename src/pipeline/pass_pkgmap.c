@@ -1703,3 +1703,226 @@ void cbm_pipeline_namespace_map_free(CBMHashTable *map) {
     cbm_ht_free(map);
 }
 
+/* ── Shared per-file import machinery ─────────────────────────────
+ *
+ * Both pipelines need the same two views of a file's imports:
+ *   1. the resolver map (local_name → module QN), one entry PER BINDING —
+ *      `import * as repo from './m'` and `import {a, b} from './m'` are
+ *      three bindings;
+ *   2. the IMPORTS edges (File → module node). The graph buffer dedupes
+ *      edges by (source, target, type), so multiple bindings from one
+ *      module collapse into ONE edge that must carry every local name —
+ *      previously only the first survived and the rest silently fell out
+ *      of the resolver map, degrading their calls to unique_name.
+ * Keeping both here (next to cbm_pipeline_resolve_import_node) replaces
+ * the two hand-kept-in-sync copies in pass_definitions.c/pass_calls.c. */
+
+int cbm_pipeline_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *rel_path,
+                                  const CBMFileResult *result, const char ***out_keys,
+                                  const char ***out_vals, int *out_count) {
+    *out_keys = NULL;
+    *out_vals = NULL;
+    *out_count = 0;
+    if (!ctx || !result || result->imports.count <= 0) {
+        return 0;
+    }
+    const char **keys = calloc((size_t)result->imports.count, sizeof(const char *));
+    const char **vals = calloc((size_t)result->imports.count, sizeof(const char *));
+    if (!keys || !vals) {
+        free(keys);
+        free(vals);
+        return 0;
+    }
+    int count = 0;
+    for (int i = 0; i < result->imports.count; i++) {
+        const CBMImport *imp = &result->imports.items[i];
+        if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
+            continue;
+        }
+        const cbm_gbuf_node_t *target = module_node_for_import(ctx, rel_path, imp->module_path);
+        if (!target) {
+            continue;
+        }
+        keys[count] = strdup(imp->local_name);
+        vals[count] = target->qualified_name; /* borrowed from gbuf */
+        count++;
+    }
+    *out_keys = keys;
+    *out_vals = vals;
+    *out_count = count;
+    return 0;
+}
+
+void cbm_pipeline_free_import_map(const char **keys, const char **vals, int count) {
+    if (keys) {
+        for (int i = 0; i < count; i++) {
+            free((void *)keys[i]);
+        }
+        free((void *)keys);
+    }
+    free((void *)vals);
+}
+
+/* One IMPORTS edge per imported MODULE, its properties carrying every
+ * local binding name (JSON-escaped, comma-joined): the edge-dedup key is
+ * (source, target, type), so per-binding inserts would silently drop all
+ * but the first binding's local_name. */
+int cbm_pipeline_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                     const char *rel, CBMHashTable *namespace_map) {
+    enum { IMP_NAMES_CAP = 4096 };
+    if (!ctx || !result || result->imports.count <= 0) {
+        return 0;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+    const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+    free(file_qn);
+    if (!source_node) {
+        return 0;
+    }
+    int n = result->imports.count;
+    int64_t *tgt_ids = calloc((size_t)n, sizeof(int64_t));
+    char **joined = calloc((size_t)n, sizeof(char *));
+    if (!tgt_ids || !joined) {
+        free(tgt_ids);
+        free(joined);
+        return 0;
+    }
+    int groups = 0;
+    char *fq = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+    for (int j = 0; j < n; j++) {
+        const CBMImport *imp = &result->imports.items[j];
+        if (!imp->module_path) {
+            continue;
+        }
+        const cbm_gbuf_node_t *target =
+            cbm_pipeline_resolve_import_node(ctx, rel, fq, imp, namespace_map);
+        if (!target || target->id == source_node->id) {
+            continue;
+        }
+        int g = 0;
+        while (g < groups && tgt_ids[g] != target->id) {
+            g++;
+        }
+        if (g == groups) {
+            tgt_ids[groups] = target->id;
+            joined[groups] = calloc(1, IMP_NAMES_CAP);
+            if (!joined[groups]) {
+                break;
+            }
+            groups++;
+        }
+        const char *ln = imp->local_name ? imp->local_name : "";
+        if (ln[0] && joined[g]) {
+            size_t cur = strlen(joined[g]);
+            size_t lnl = strlen(ln);
+            if (cur + lnl + 2 < IMP_NAMES_CAP) {
+                if (cur > 0) {
+                    joined[g][cur++] = ',';
+                }
+                memcpy(joined[g] + cur, ln, lnl + 1);
+            }
+        }
+    }
+    free(fq);
+    int count = 0;
+    for (int g = 0; g < groups; g++) {
+        char esc_ln[CBM_SZ_512];
+        cbm_json_escape(esc_ln, sizeof(esc_ln), joined[g] ? joined[g] : "");
+        char imp_props[CBM_SZ_1K];
+        snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
+        cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, tgt_ids[g], "IMPORTS", imp_props);
+        count++;
+        free(joined[g]);
+    }
+    free(tgt_ids);
+    free(joined);
+    return count;
+}
+
+/* Edge-based variant for contexts without a pipeline ctx (the parallel
+ * resolve workers read the merged gbuf read-only; the IMPORTS edges were
+ * created with full namespace/alias resolution during merge). Splits the
+ * comma-joined local_name list back into one map entry per binding. */
+int cbm_pipeline_import_map_from_edges(const cbm_gbuf_t *gbuf, const char *project_name,
+                                       const char *rel_path, const char ***out_keys,
+                                       const char ***out_vals, int *out_count) {
+    *out_keys = NULL;
+    *out_vals = NULL;
+    *out_count = 0;
+    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
+    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(gbuf, file_qn);
+    free(file_qn);
+    if (!file_node) {
+        return 0;
+    }
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    int rc = cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges,
+                                                &edge_count);
+    if (rc != 0 || edge_count == 0) {
+        return 0;
+    }
+    /* Pass 1: total bindings across all edges (commas + 1 per list). */
+    int total = 0;
+    for (int i = 0; i < edge_count; i++) {
+        const char *start =
+            edges[i]->properties_json ? strstr(edges[i]->properties_json, "\"local_name\":\"")
+                                      : NULL;
+        if (!start) {
+            continue;
+        }
+        start += strlen("\"local_name\":\"");
+        const char *end = strchr(start, '"');
+        if (!end || end <= start) {
+            continue;
+        }
+        total++;
+        for (const char *c = start; c < end; c++) {
+            if (*c == ',') {
+                total++;
+            }
+        }
+    }
+    if (total == 0) {
+        return 0;
+    }
+    const char **keys = calloc((size_t)total, sizeof(const char *));
+    const char **vals = calloc((size_t)total, sizeof(const char *));
+    if (!keys || !vals) {
+        free(keys);
+        free(vals);
+        return 0;
+    }
+    int count = 0;
+    for (int i = 0; i < edge_count; i++) {
+        const cbm_gbuf_edge_t *e = edges[i];
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id((cbm_gbuf_t *)gbuf, e->target_id);
+        if (!target || !e->properties_json) {
+            continue;
+        }
+        const char *start = strstr(e->properties_json, "\"local_name\":\"");
+        if (!start) {
+            continue;
+        }
+        start += strlen("\"local_name\":\"");
+        const char *end = strchr(start, '"');
+        if (!end || end <= start) {
+            continue;
+        }
+        const char *tok = start;
+        while (tok < end && count < total) {
+            const char *comma = memchr(tok, ',', (size_t)(end - tok));
+            const char *tok_end = comma ? comma : end;
+            if (tok_end > tok) {
+                keys[count] = cbm_strndup(tok, (size_t)(tok_end - tok));
+                vals[count] = target->qualified_name;
+                count++;
+            }
+            tok = tok_end + 1;
+        }
+    }
+    *out_keys = keys;
+    *out_vals = vals;
+    *out_count = count;
+    return 0;
+}

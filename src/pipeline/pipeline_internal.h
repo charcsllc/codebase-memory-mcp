@@ -98,6 +98,27 @@ void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const char *module_path);
 
+/* Per-file (local_name → module QN) resolver map, one entry per import
+ * binding. Values are borrowed from the graph buffer; free with
+ * cbm_pipeline_free_import_map. */
+int cbm_pipeline_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *rel_path,
+                                  const CBMFileResult *result, const char ***out_keys,
+                                  const char ***out_vals, int *out_count);
+void cbm_pipeline_free_import_map(const char **keys, const char **vals, int count);
+
+/* Edge-based variant (no ctx needed): rebuilds the map from a file's
+ * IMPORTS edges, splitting the comma-joined local_name list back into one
+ * entry per binding. Used by the parallel resolve workers (read-only gbuf)
+ * and as the sequential fallback when no extraction result is cached. */
+int cbm_pipeline_import_map_from_edges(const cbm_gbuf_t *gbuf, const char *project_name,
+                                       const char *rel_path, const char ***out_keys,
+                                       const char ***out_vals, int *out_count);
+
+/* One IMPORTS edge per imported module; properties carry every binding
+ * name comma-joined (edge dedup would drop repeated File→module edges). */
+int cbm_pipeline_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                     const char *rel, CBMHashTable *namespace_map);
+
 /* Resolve an import to its in-graph target node, or NULL if unresolvable.
  *
  * Resolution order (first hit wins):
