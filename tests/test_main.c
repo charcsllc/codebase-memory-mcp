@@ -106,7 +106,14 @@ extern void suite_dump_verify_io(void);
  * caches at thread teardown (pass_parallel.c). */
 extern void cbm_kind_in_set_free_cache(void);
 
-int main(void) {
+const char **tf_suite_filter = NULL;
+int tf_suite_filter_count = 0;
+
+int main(int argc, char **argv) {
+    if (argc > 1) {
+        tf_suite_filter = (const char **)(argv + 1);
+        tf_suite_filter_count = argc - 1;
+    }
     printf("\n  codebase-memory-mcp  C test suite\n");
 
     /* Foundation */
