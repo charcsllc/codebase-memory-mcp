@@ -1116,10 +1116,12 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
         return cbm_pipeline_fqn_module(ctx ? ctx->project_name : NULL, module_path);
     }
 
-    /* 1. Try relative import resolution (existing logic) */
+    /* 1. Try relative import resolution (existing logic). The resolver
+     * already normalized the extension (JS whitelist) — do NOT re-strip,
+     * or dotted basenames ('./b.repository') lose their last segment. */
     char *resolved = cbm_pipeline_resolve_relative_import(source_rel, module_path);
     if (resolved) {
-        char *qn = cbm_pipeline_fqn_module(ctx->project_name, resolved);
+        char *qn = cbm_pipeline_fqn_module_noext(ctx->project_name, resolved);
         free(resolved);
         return qn;
     }
@@ -1338,6 +1340,44 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     return found;
 }
 
+/* True for a JS-style relative import ('./x', '../y/z') whose basename
+ * still contains a dot after extension stripping — the only case where the
+ * resolved QN may carry a spurious trailing segment (unknown extension). */
+static bool js_relative_dotted_basename(const char *module_path) {
+    if (!module_path || module_path[0] != '.') {
+        return false;
+    }
+    if (!(module_path[1] == '/' || (module_path[1] == '.' && module_path[2] == '/'))) {
+        return false;
+    }
+    const char *base = strrchr(module_path, '/');
+    base = base ? base + 1 : module_path;
+    return strchr(base, '.') != NULL;
+}
+
+/* Resolve an import's module path to its in-graph module node: exact QN
+ * first; for JS relative imports with a dotted basename, retry without the
+ * trailing dot-segment (module QNs strip the real file extension, so
+ * './data.yaml' needs the retry while './b.repository' hits exactly). */
+static const cbm_gbuf_node_t *module_node_for_import(const cbm_pipeline_ctx_t *ctx,
+                                                     const char *source_rel,
+                                                     const char *module_path) {
+    char *target_qn = cbm_pipeline_resolve_module(ctx, source_rel, module_path);
+    if (!target_qn) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+    if (!target && js_relative_dotted_basename(module_path)) {
+        char *dot = strrchr(target_qn, '.');
+        if (dot && dot != target_qn) {
+            *dot = '\0';
+            target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+        }
+    }
+    free(target_qn);
+    return target;
+}
+
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
@@ -1348,9 +1388,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     }
 
     /* Strategy 1: module-path resolution → existing node (Python/TS/Go). */
-    char *target_qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
-    const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
-    free(target_qn);
+    const cbm_gbuf_node_t *target = module_node_for_import(ctx, source_rel, imp->module_path);
     if (target) {
         return target;
     }
@@ -1664,3 +1702,4 @@ void cbm_pipeline_namespace_map_free(CBMHashTable *map) {
     cbm_ht_foreach(map, ns_map_free_entry, NULL);
     cbm_ht_free(map);
 }
+

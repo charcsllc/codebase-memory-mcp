@@ -6142,8 +6142,43 @@ TEST(pipeline_committed_counts_match_persisted) {
     PASS();
 }
 
+/* JS relative imports must keep dotted basenames: NestJS-style files
+ * (pedidos.repository.ts, x.service.ts) are imported extensionless as
+ * './pedidos.repository' — stripping from the last dot mangled them into
+ * a sibling ('pedidos') and poisoned the import map for the whole naming
+ * convention. Only known JS-resolvable extensions are stripped. */
+TEST(pipeline_relative_import_keeps_dotted_basename) {
+    char *r = cbm_pipeline_resolve_relative_import("backend/src/a/a.service.ts",
+                                                   "./b.repository");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "backend/src/a/b.repository");
+    free(r);
+
+    /* Explicit known extension still strips. */
+    r = cbm_pipeline_resolve_relative_import("backend/src/a/a.service.ts", "./c.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "backend/src/a/c");
+    free(r);
+
+    /* Parent hops unaffected. */
+    r = cbm_pipeline_resolve_relative_import("backend/src/a/a.service.ts", "../shared/audit");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "backend/src/shared/audit");
+    free(r);
+
+    /* Dotted basename WITH a known extension strips only the extension. */
+    r = cbm_pipeline_resolve_relative_import("backend/src/a/a.service.ts",
+                                             "./b.repository.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "backend/src/a/b.repository");
+    free(r);
+
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Index lock */
+    RUN_TEST(pipeline_relative_import_keeps_dotted_basename);
     RUN_TEST(pipeline_lock_try_acquire);
     RUN_TEST(pipeline_lock_blocking);
     RUN_TEST(pipeline_lock_contention);

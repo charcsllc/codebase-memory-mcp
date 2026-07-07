@@ -97,14 +97,17 @@ static void strip_init_or_index(const char **segments, int *seg_count, const cha
 
 /* ── Public API ──────────────────────────────────────────────────── */
 
-char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const char *name) {
+static char *fqn_compute_ex(const char *project, const char *rel_path, const char *name,
+                            bool strip_extension) {
     if (!project) {
         return strdup("");
     }
 
     char *path = strdup(rel_path ? rel_path : "");
     cbm_normalize_path_sep(path);
-    strip_file_extension(path);
+    if (strip_extension) {
+        strip_file_extension(path);
+    }
 
     const char *segments[CBM_SZ_256];
     int seg_count = 0;
@@ -122,8 +125,20 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
     return result;
 }
 
+char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const char *name) {
+    return fqn_compute_ex(project, rel_path, name, true);
+}
+
 char *cbm_pipeline_fqn_module(const char *project, const char *rel_path) {
     return cbm_pipeline_fqn_compute(project, rel_path, NULL);
+}
+
+/* For RESOLVED import paths, which are already extensionless: re-stripping
+ * would eat the last dot-segment of a dotted basename ('backend/x/b.repository'
+ * → 'b'), pointing the import map at a sibling that does not exist. Disk
+ * paths (which carry a real extension) keep using the stripping variant. */
+char *cbm_pipeline_fqn_module_noext(const char *project, const char *rel_path) {
+    return fqn_compute_ex(project, rel_path, NULL, false);
 }
 
 enum {
@@ -227,17 +242,22 @@ static char *resolve_python_relative(char *buf, size_t buf_size, const char *mod
 
 /* Strip a trailing file extension from a segment (e.g. "helpers.ts" → "helpers").
  * Returns the new segment length. */
+/* Strip a KNOWN JS-resolvable extension from the import's final segment.
+ * Extensionless imports of dotted basenames ('./pedidos.repository' for
+ * pedidos.repository.ts — the NestJS-style naming convention) must keep
+ * their dots: stripping from the last dot unconditionally mangled them
+ * into a sibling module and poisoned the import map for every
+ * x.service / x.repository / x.routes file. Unknown extensions are kept;
+ * cbm_pipeline_resolve_import_node retries without the trailing segment
+ * when the exact module node is absent. */
 static size_t strip_ext(const char *seg_start, size_t seg_len) {
-    const char *seg_end = seg_start + seg_len;
-    const char *dot = NULL;
-    for (const char *d = seg_end - FQN_SEP_LEN; d >= seg_start; d--) {
-        if (*d == '.') {
-            dot = d;
-            break;
+    static const char *const exts[] = {".js", ".jsx", ".ts",  ".tsx", ".mjs",
+                                       ".cjs", ".mts", ".cts", ".json", NULL};
+    for (int i = 0; exts[i]; i++) {
+        size_t elen = strlen(exts[i]);
+        if (seg_len > elen && strncmp(seg_start + seg_len - elen, exts[i], elen) == 0) {
+            return seg_len - elen;
         }
-    }
-    if (dot && dot > seg_start) {
-        return (size_t)(dot - seg_start);
     }
     return seg_len;
 }
