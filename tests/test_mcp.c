@@ -569,7 +569,9 @@ TEST(tool_index_status_includes_git_metadata) {
     ASSERT_NOT_NULL(strstr(inner, "\"root_path\""));
     ASSERT_NOT_NULL(strstr(inner, "\"git\""));
     ASSERT_NOT_NULL(strstr(inner, "\"is_git\":false"));
-    ASSERT_NOT_NULL(strstr(inner, "\"root_exists\":true"));
+    /* Slimmed git block: internals (root_exists, git_dir, base_sha...)
+     * no longer ship — agents only need the identity fields. */
+    ASSERT(strstr(inner, "\"root_exists\"") == NULL);
 
     free(inner);
     free(resp);
@@ -707,6 +709,85 @@ TEST(tool_trace_call_path_prefers_definition) {
     ASSERT_NOT_NULL(strstr(inner, "callee"));
     free(inner);
     free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* MCP responses are read by LLM agents: every redundant byte burns the
+ * consumer's context window. QNs must elide the "<project>." prefix (the
+ * request is already project-scoped; QN-accepting inputs re-resolve
+ * suffix forms), and node properties must omit zero/false/empty defaults
+ * plus the internal similarity fingerprint. */
+TEST(tool_responses_elide_project_prefix_and_defaults) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "tokslim-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/tokslim");
+    cbm_node_t f = {.project = proj,
+                    .label = "Function",
+                    .name = "computeTotals",
+                    .qualified_name = "tokslim-proj.src.billing.computeTotals",
+                    .file_path = "src/billing.c",
+                    .start_line = 3,
+                    .end_line = 9,
+                    .properties_json = "{\"complexity\":4,\"loop_count\":0,"
+                                       "\"is_test\":false,\"signature\":\"\","
+                                       "\"fingerprint\":\"abc123\"}"};
+    cbm_node_t g = {.project = proj,
+                    .label = "Function",
+                    .name = "printInvoice",
+                    .qualified_name = "tokslim-proj.src.billing.printInvoice",
+                    .file_path = "src/billing.c",
+                    .start_line = 12,
+                    .end_line = 20};
+    int64_t idf = cbm_store_upsert_node(st, &f);
+    int64_t idg = cbm_store_upsert_node(st, &g);
+    ASSERT_GT(idf, 0);
+    ASSERT_GT(idg, 0);
+    cbm_edge_t e = {.project = proj, .source_id = idf, .target_id = idg, .type = "CALLS"};
+    cbm_store_insert_edge(st, &e);
+
+    /* search_graph: elided QN, no full-prefix QN, defaults omitted. */
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":"
+             "{\"name\":\"search_graph\",\"arguments\":{\"project\":\"%s\","
+             "\"name_pattern\":\"computeTotals\"}}}",
+             proj);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    ASSERT(strstr(resp, "src.billing.computeTotals") != NULL);
+    ASSERT(strstr(resp, "tokslim-proj.src.billing.computeTotals") == NULL);
+    ASSERT(strstr(resp, "complexity") != NULL);
+    ASSERT(strstr(resp, "loop_count") == NULL);  /* zero default omitted */
+    ASSERT(strstr(resp, "is_test") == NULL);     /* false default omitted */
+    ASSERT(strstr(resp, "fingerprint") == NULL); /* internal hash omitted */
+    free(resp);
+
+    /* trace_path: elided QNs in hops. */
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":"
+             "{\"name\":\"trace_path\",\"arguments\":{\"project\":\"%s\","
+             "\"function_name\":\"computeTotals\",\"direction\":\"both\"}}}",
+             proj);
+    resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    ASSERT(strstr(resp, "src.billing.printInvoice") != NULL);
+    ASSERT(strstr(resp, "tokslim-proj.src.billing.printInvoice") == NULL);
+    free(resp);
+
+    /* get_code_snippet accepts the elided (prefix-less) QN round-trip. */
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":"
+             "{\"name\":\"get_code_snippet\",\"arguments\":{\"project\":\"%s\","
+             "\"qualified_name\":\"src.billing.computeTotals\"}}}",
+             proj);
+    resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    ASSERT(strstr(resp, "computeTotals") != NULL);
+    free(resp);
+
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -1726,8 +1807,8 @@ TEST(snippet_ambiguous_short_name) {
     /* Must NOT have "source" */
     ASSERT_NULL(strstr(resp, "\"source\""));
     /* Should have at least 2 suggestions with qualified_name */
-    ASSERT_NOT_NULL(strstr(resp, "test-project.cmd.server.Run"));
-    ASSERT_NOT_NULL(strstr(resp, "test-project.cmd.worker.Run"));
+    ASSERT_NOT_NULL(strstr(resp, "\"cmd.server.Run\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"cmd.worker.Run\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -2439,6 +2520,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_call_path_prefers_definition);
+    RUN_TEST(tool_responses_elide_project_prefix_and_defaults);
     RUN_TEST(tool_trace_call_path_dedupes_multipath_node);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
