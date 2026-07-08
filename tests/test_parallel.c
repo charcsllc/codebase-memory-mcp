@@ -1391,6 +1391,102 @@ TEST(parallel_import_map_dotted_and_multibinding) {
     PASS();
 }
 
+/* ── PHP: `use` imports must beat same-name distractors ───────────── */
+
+typedef struct {
+    const cbm_gbuf_t *gb;
+    int to_store;
+    int to_store_strong;
+    int to_dup;
+} php_use_ctx_t;
+
+static void php_use_scan(const cbm_gbuf_edge_t *e, void *ud) {
+    php_use_ctx_t *c = (php_use_ctx_t *)ud;
+    if (strcmp(e->type, "CALLS") != 0 || !e->properties_json ||
+        !strstr(e->properties_json, "findWidgets")) {
+        return;
+    }
+    const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id((cbm_gbuf_t *)c->gb, e->target_id);
+    if (!t) {
+        return;
+    }
+    if (strstr(t->qualified_name, "Store.Store.findWidgets")) {
+        c->to_store++;
+        /* Deterministic evidence, not a distance tie-break that happens to
+         * land right: import-confirmed or receiver-confirmed only. */
+        if (strstr(e->properties_json, "\"strategy\":\"import_map") ||
+            strstr(e->properties_json, "\"strategy\":\"qualified_suffix\"")) {
+            c->to_store_strong++;
+        }
+    }
+    if (strstr(t->qualified_name, "Dup")) {
+        c->to_dup++;
+    }
+}
+
+/* Namespace-import map values were File-node QNs ("...src.Store.__file__"),
+ * so the import_map candidate never matched a real symbol and PHP member
+ * calls decayed to suffix matching — where a same-named class in another
+ * namespace WON (Store::findWidgets resolved to Dup::findWidgets in the
+ * language bench). */
+TEST(sequential_php_use_import_beats_distractor) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_php_use_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char dsrc[512];
+    snprintf(dsrc, sizeof(dsrc), "%s/src", tmpdir);
+    cbm_mkdir(dsrc);
+    char f_store[512], f_dup[512], f_idx[512];
+    snprintf(f_store, sizeof(f_store), "%s/src/Store.php", tmpdir);
+    snprintf(f_dup, sizeof(f_dup), "%s/src/Dup.php", tmpdir);
+    snprintf(f_idx, sizeof(f_idx), "%s/index.php", tmpdir);
+    FILE *f = fopen(f_store, "w");
+    fprintf(f, "<?php\nnamespace App\\Store;\n\nclass Store {\n"
+               "    public static function findWidgets() { return 1; }\n"
+               "    public static function renderPanel() { return 2; }\n}\n");
+    fclose(f);
+    f = fopen(f_dup, "w");
+    fprintf(f, "<?php\nnamespace App\\Dup;\n\nclass Dup {\n"
+               "    public static function findWidgets() { return 9; }\n}\n");
+    fclose(f);
+    f = fopen(f_idx, "w");
+    fprintf(f, "<?php\nuse App\\Store\\Store;\n\nfunction run() {\n"
+               "    return Store::findWidgets() + Store::renderPanel();\n}\n");
+    fclose(f);
+
+    cbm_file_info_t files[3] = {0};
+    files[0].path = f_store;
+    files[0].rel_path = (char *)"src/Store.php";
+    files[0].language = CBM_LANG_PHP;
+    files[1].path = f_dup;
+    files[1].rel_path = (char *)"src/Dup.php";
+    files[1].language = CBM_LANG_PHP;
+    files[2].path = f_idx;
+    files[2].rel_path = (char *)"index.php";
+    files[2].language = CBM_LANG_PHP;
+
+    cbm_gbuf_t *gbuf = run_sequential("cbm_php_use", tmpdir, files, 3);
+    ASSERT_NOT_NULL(gbuf);
+
+    /* findWidgets must land on Store's method — never on Dup's. */
+    php_use_ctx_t pc = {0};
+    pc.gb = gbuf;
+    cbm_gbuf_foreach_edge(gbuf, php_use_scan, &pc);
+    ASSERT_GTE(pc.to_store, 1);
+    ASSERT_GTE(pc.to_store_strong, 1);
+    ASSERT_EQ(pc.to_dup, 0);
+
+    cbm_gbuf_free(gbuf);
+    unlink(f_store);
+    unlink(f_dup);
+    unlink(f_idx);
+    rmdir(dsrc);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
@@ -1429,6 +1525,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_template_url_gets_method_route);
     RUN_TEST(parallel_inline_route_handler_gets_node_and_handles);
     RUN_TEST(parallel_import_map_dotted_and_multibinding);
+    RUN_TEST(sequential_php_use_import_beats_distractor);
 
     /* Cleanup shared state */
     parity_teardown();
