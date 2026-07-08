@@ -58,6 +58,20 @@ WEAK restantes, correctos y documentados: C (headers sin semántica de import �
 target correcto gana por puntuación) y Rust `use mod::fn` de función suelta
 (unique_name 0.75 al target correcto).
 
+## 4b. Dieta de tokens en las respuestas MCP
+
+Las respuestas de las tools las consume un LLM: cada byte redundante quema la
+ventana de contexto del agente en cada llamada. Cortes sin pérdida (round-trip
+garantizado), medidos sobre 9 llamadas típicas en ecommerce_pets:
+**21.7 KB → 18.1 KB (−17%; trace_path −23%, get_architecture −25%,
+index_status −55%, list_projects −53%)**.
+
+| Corte | Detalle |
+|---|---|
+| Prefijo de proyecto elidido en QNs | La petición ya está acotada a un proyecto; el slug repetía ~9 tokens por fila. `get_code_snippet` resuelve formas sin prefijo (tier de sufijo), `search_graph` reintenta `qn_pattern` con prefijo, `query_graph` queda verbatim (Cypher crudo compara valores almacenados). |
+| Properties sin defaults | `loop_count:0`, `is_test:false`, strings vacíos y el `fingerprint` interno (hash de similitud inaccionable) se omiten — eran el grueso del peso por fila de search_graph. |
+| Campos estructuralmente redundantes | `label` por fila cuando la query ya filtró por label; `file_path` vacíos; path RELATIVO en snippet (el absoluto repetía la raíz del repo); `expected_*` solo si discrepa; git block de list_projects a campos de identidad; adr_hint de una línea. |
+
 ## 5. Robustez operacional
 
 | Commit | Mejora |
