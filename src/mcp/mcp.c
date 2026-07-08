@@ -875,19 +875,20 @@ static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const
     cbm_git_context_t ctx = {0};
     (void)cbm_git_context_resolve(root_path, &ctx);
 
+    /* Agents consume this: keep the fields that identify the checkout
+     * (is_git, branch, head_sha) plus non-default flags. Repo internals
+     * (git_dir, canonical_root, branch_slug, base_sha) stayed unread by
+     * every known consumer and repeated ~40 tokens per project. */
     yyjson_mut_val *git = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_bool(doc, git, "is_git", ctx.is_git);
-    yyjson_mut_obj_add_bool(doc, git, "is_worktree", ctx.is_worktree);
-    yyjson_mut_obj_add_bool(doc, git, "is_detached", ctx.is_detached);
-    yyjson_mut_obj_add_bool(doc, git, "root_exists", ctx.root_exists);
-    add_git_context_string(doc, git, "worktree_root", ctx.worktree_root);
-    add_git_context_string(doc, git, "git_dir", ctx.git_dir);
-    add_git_context_string(doc, git, "git_common_dir", ctx.git_common_dir);
-    add_git_context_string(doc, git, "canonical_root", ctx.canonical_root);
+    if (ctx.is_worktree) {
+        yyjson_mut_obj_add_bool(doc, git, "is_worktree", true);
+    }
+    if (ctx.is_detached) {
+        yyjson_mut_obj_add_bool(doc, git, "is_detached", true);
+    }
     add_git_context_string(doc, git, "branch", ctx.branch);
-    add_git_context_string(doc, git, "branch_slug", ctx.branch_slug);
     add_git_context_string(doc, git, "head_sha", ctx.head_sha);
-    add_git_context_string(doc, git, "base_sha", ctx.base_sha);
     yyjson_mut_obj_add_val(doc, obj, "git", git);
 
     cbm_git_context_free(&ctx);
@@ -1290,6 +1291,9 @@ static char *bm25_file_pattern_like(const char *file_pattern) {
 /* Run the BM25 full-text search path and return the JSON result string.
  * Returns NULL if FTS5 is unavailable or the query produced no usable tokens,
  * in which case the caller falls back to the regex-based search path. */
+/* Defined below (see the token-diet rationale there). */
+static const char *qn_display(const char *qn, const char *project);
+
 static char *bm25_search(cbm_store_t *store, const char *project, const char *query,
                          const char *file_pattern, int limit, int offset) {
     sqlite3 *db = cbm_store_get_db(store);
@@ -1399,8 +1403,9 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         yyjson_mut_val *item = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_strcpy(doc, item, "name",
                                   (const char *)sqlite3_column_text(stmt, BM25_COL_NAME));
-        yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_QN));
+        yyjson_mut_obj_add_strcpy(
+            doc, item, "qualified_name",
+            qn_display((const char *)sqlite3_column_text(stmt, BM25_COL_QN), project));
         yyjson_mut_obj_add_strcpy(doc, item, "label",
                                   (const char *)sqlite3_column_text(stmt, BM25_COL_LABEL));
         yyjson_mut_obj_add_strcpy(doc, item, "file_path",
@@ -1429,6 +1434,23 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
 static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *obj,
                                           const char *properties_json);
 
+/* Response QNs elide the "<project>." prefix: the request is already
+ * project-scoped, so repeating the slug on every row only burns the
+ * consuming agent's context window (~9 tokens per row on a typical repo
+ * slug). Lossless round-trip: get_code_snippet re-resolves elided QNs via
+ * its suffix tier, and search_graph retries qn_pattern with the prefix.
+ * query_graph rows stay verbatim (raw Cypher compares stored values). */
+static const char *qn_display(const char *qn, const char *project) {
+    if (!qn || !project || !project[0]) {
+        return qn ? qn : "";
+    }
+    size_t plen = strlen(project);
+    if (strncmp(qn, project, plen) == 0 && qn[plen] == '.' && qn[plen + 1] != '\0') {
+        return qn + plen + 1;
+    }
+    return qn;
+}
+
 /* Emit the cbm_store_search results as a JSON "results" array on the doc.
  * Property docs created via enrich_node_properties are collected in
  * *out_pdocs (count in *out_pdoc_count) and must be freed by the caller
@@ -1437,7 +1459,8 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
 static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 const cbm_search_output_t *out, cbm_store_t *store,
                                 const char *relationship, bool include_connected, int offset,
-                                yyjson_doc ***out_pdocs, int *out_pdoc_count) {
+                                const char *filtered_label, yyjson_doc ***out_pdocs,
+                                int *out_pdoc_count) {
     yyjson_doc **pdocs = out->count > 0 ? malloc((size_t)out->count * sizeof(yyjson_doc *)) : NULL;
     int pdoc_count = 0;
     yyjson_mut_obj_add_int(doc, root, "total", out->total);
@@ -1447,10 +1470,15 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
         yyjson_mut_val *item = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_str(doc, item, "name", sr->node.name ? sr->node.name : "");
         yyjson_mut_obj_add_str(doc, item, "qualified_name",
-                               sr->node.qualified_name ? sr->node.qualified_name : "");
-        yyjson_mut_obj_add_str(doc, item, "label", sr->node.label ? sr->node.label : "");
-        yyjson_mut_obj_add_str(doc, item, "file_path",
-                               sr->node.file_path ? sr->node.file_path : "");
+                               qn_display(sr->node.qualified_name, sr->node.project));
+        /* When the query filtered by label, every row repeats it — the
+         * caller already knows. Mixed results keep their labels. */
+        if (!filtered_label) {
+            yyjson_mut_obj_add_str(doc, item, "label", sr->node.label ? sr->node.label : "");
+        }
+        if (sr->node.file_path && sr->node.file_path[0]) {
+            yyjson_mut_obj_add_str(doc, item, "file_path", sr->node.file_path);
+        }
         yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
         yyjson_mut_obj_add_int(doc, item, "out_degree", sr->out_degree);
         if (include_connected && sr->node.id > 0) {
@@ -1606,13 +1634,28 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     cbm_search_output_t out = {0};
     cbm_store_search(store, &params, &out);
 
+    /* Responses elide the project prefix from QNs; an agent copying one
+     * back as an exact qn_pattern must still hit. Retry once, prefixed. */
+    if (out.total == 0 && qn_pattern && qn_pattern[0] && qn_pattern[0] != '*') {
+        const char *proj_for_qn = project ? project : srv->current_project;
+        if (proj_for_qn && strncmp(qn_pattern, proj_for_qn, strlen(proj_for_qn)) != 0) {
+            char prefixed[CBM_SZ_1K];
+            snprintf(prefixed, sizeof(prefixed), "%s.%s", proj_for_qn, qn_pattern);
+            cbm_store_search_free(&out);
+            memset(&out, 0, sizeof(out));
+            params.qn_pattern = prefixed;
+            cbm_store_search(store, &params, &out);
+            params.qn_pattern = qn_pattern;
+        }
+    }
+
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
     yyjson_doc **props_docs = NULL;
     int props_doc_count = 0;
-    emit_search_results(doc, root, &out, store, relationship, include_connected, offset,
+    emit_search_results(doc, root, &out, store, relationship, include_connected, offset, label,
                         &props_docs, &props_doc_count);
 
     /* Add diagnostic hint when zero results */
@@ -1914,6 +1957,7 @@ static void append_cross_repo_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
 
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
+    const char *arch_project = project ? project : srv->current_project;
     char *scope_path = cbm_mcp_get_string_arg(args, "path");
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
@@ -2062,7 +2106,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                                    arch.entry_points[i].name ? arch.entry_points[i].name : "");
             yyjson_mut_obj_add_str(
                 doc, item, "qualified_name",
-                arch.entry_points[i].qualified_name ? arch.entry_points[i].qualified_name : "");
+                qn_display(arch.entry_points[i].qualified_name, arch_project));
             yyjson_mut_obj_add_str(doc, item, "file",
                                    arch.entry_points[i].file ? arch.entry_points[i].file : "");
             yyjson_mut_arr_add_val(eps, item);
@@ -2094,8 +2138,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_str(doc, item, "name",
                                    arch.hotspots[i].name ? arch.hotspots[i].name : "");
             yyjson_mut_obj_add_str(doc, item, "qualified_name",
-                                   arch.hotspots[i].qualified_name ? arch.hotspots[i].qualified_name
-                                                                   : "");
+                                   qn_display(arch.hotspots[i].qualified_name, arch_project));
             yyjson_mut_obj_add_int(doc, item, "fan_in", arch.hotspots[i].fan_in);
             yyjson_mut_arr_add_val(hotspots, item);
         }
@@ -2310,7 +2353,7 @@ static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_resul
                                tr->visited[i].node.name ? tr->visited[i].node.name : "");
         yyjson_mut_obj_add_str(
             doc, item, "qualified_name",
-            tr->visited[i].node.qualified_name ? tr->visited[i].node.qualified_name : "");
+            qn_display(tr->visited[i].node.qualified_name, tr->visited[i].node.project));
         yyjson_mut_obj_add_int(doc, item, "hop", tr->visited[i].hop);
         if (risk_labels) {
             yyjson_mut_obj_add_str(doc, item, "risk",
@@ -2768,7 +2811,9 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
 
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, root, "edges", edges);
-    if (exp_nodes >= 0) {
+    /* Only worth tokens when they DISAGREE with the persisted counts —
+     * equal values duplicate nodes/edges on every successful index. */
+    if (exp_nodes >= 0 && (exp_nodes != nodes || exp_edges != edges)) {
         yyjson_mut_obj_add_int(doc, root, "expected_nodes", exp_nodes);
         yyjson_mut_obj_add_int(doc, root, "expected_edges", exp_edges);
     }
@@ -2799,11 +2844,9 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     bool adr_exists = (stat(adr_path, &adr_st) == 0);
     yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
     if (!adr_exists && !degraded) {
-        yyjson_mut_obj_add_str(
-            doc, root, "adr_hint",
-            "Project indexed. Consider creating an Architecture Decision Record: "
-            "explore the codebase with get_architecture(aspects=['all']), then use "
-            "manage_adr(mode='store') to persist architectural insights across sessions.");
+        yyjson_mut_obj_add_str(doc, root, "adr_hint",
+                               "No ADR yet — manage_adr(mode='store') persists "
+                               "architecture notes across sessions.");
     }
 
     bool has_artifact = cbm_artifact_exists(repo_path);
@@ -2953,10 +2996,12 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
     for (int i = 0; i < count; i++) {
         yyjson_mut_val *s = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_str(doc, s, "qualified_name",
-                               nodes[i].qualified_name ? nodes[i].qualified_name : "");
+                               qn_display(nodes[i].qualified_name, nodes[i].project));
         yyjson_mut_obj_add_str(doc, s, "name", nodes[i].name ? nodes[i].name : "");
         yyjson_mut_obj_add_str(doc, s, "label", nodes[i].label ? nodes[i].label : "");
-        yyjson_mut_obj_add_str(doc, s, "file_path", nodes[i].file_path ? nodes[i].file_path : "");
+        if (nodes[i].file_path && nodes[i].file_path[0]) {
+            yyjson_mut_obj_add_str(doc, s, "file_path", nodes[i].file_path);
+        }
         yyjson_mut_arr_append(arr, s);
     }
     yyjson_mut_obj_add_val(doc, root, "suggestions", arr);
@@ -2994,14 +3039,29 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
         if (!k) {
             continue;
         }
+        /* Token diet for the consuming agent: zero/false/empty values are
+         * recoverable defaults, and the similarity fingerprint is an
+         * internal hash no agent can act on — omit them all. */
+        if (strcmp(k, "fingerprint") == 0) {
+            continue;
+        }
         if (yyjson_is_str(val)) {
-            yyjson_mut_obj_add_str(doc, obj, k, yyjson_get_str(val));
+            const char *sv = yyjson_get_str(val);
+            if (sv && sv[0]) {
+                yyjson_mut_obj_add_str(doc, obj, k, sv);
+            }
         } else if (yyjson_is_bool(val)) {
-            yyjson_mut_obj_add_bool(doc, obj, k, yyjson_get_bool(val));
+            if (yyjson_get_bool(val)) {
+                yyjson_mut_obj_add_bool(doc, obj, k, true);
+            }
         } else if (yyjson_is_int(val)) {
-            yyjson_mut_obj_add_int(doc, obj, k, yyjson_get_int(val));
+            if (yyjson_get_int(val) != 0) {
+                yyjson_mut_obj_add_int(doc, obj, k, yyjson_get_int(val));
+            }
         } else if (yyjson_is_real(val)) {
-            yyjson_mut_obj_add_real(doc, obj, k, yyjson_get_real(val));
+            if (yyjson_get_real(val) != 0.0) {
+                yyjson_mut_obj_add_real(doc, obj, k, yyjson_get_real(val));
+            }
         }
     }
     return props_doc; /* caller frees after serialization */
@@ -3143,16 +3203,13 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 
     yyjson_mut_obj_add_str(doc, root_obj, "name", node->name ? node->name : "");
     yyjson_mut_obj_add_str(doc, root_obj, "qualified_name",
-                           node->qualified_name ? node->qualified_name : "");
+                           qn_display(node->qualified_name, node->project));
     yyjson_mut_obj_add_str(doc, root_obj, "label", node->label ? node->label : "");
 
-    const char *display_path = "";
-    if (abs_path) {
-        display_path = abs_path;
-    } else if (node->file_path) {
-        display_path = node->file_path;
-    }
-    yyjson_mut_obj_add_str(doc, root_obj, "file_path", display_path);
+    /* Repo-relative path, consistent with every other tool (the absolute
+     * form repeated the repo root on each response for no information). */
+    yyjson_mut_obj_add_str(doc, root_obj, "file_path",
+                           node->file_path ? node->file_path : "");
     yyjson_mut_obj_add_int(doc, root_obj, "start_line", start);
     yyjson_mut_obj_add_int(doc, root_obj, "end_line", end);
 

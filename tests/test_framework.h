@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <math.h>
 #include <unistd.h>
 
@@ -235,16 +236,38 @@ static inline const char *tf_reset(void) {
         } else {                                          \
             tf_fail_count++;                              \
         }                                                 \
+        /* sanitizer aborts at exit discard buffered stdout */ \
+        fflush(stdout);                                   \
     } while (0)
 
 /* ── Suite grouping ────────────────────────────────────────────── */
 
 #define SUITE(name) void suite_##name(void)
 
-#define RUN_SUITE(name)                                            \
-    do {                                                           \
-        printf("\n%s=== %s ===%s\n", tf_dim(), #name, tf_reset()); \
-        suite_##name();                                            \
+/* Optional suite filter (argv of test_main): when set, RUN_SUITE skips
+ * every suite whose name is not listed — turns a ~10-minute full run into
+ * seconds when iterating on one suite. Empty filter = run everything. */
+extern const char **tf_suite_filter;
+extern int tf_suite_filter_count;
+
+static inline bool tf_suite_selected(const char *name) {
+    if (tf_suite_filter_count <= 0) {
+        return true;
+    }
+    for (int tf_i = 0; tf_i < tf_suite_filter_count; tf_i++) {
+        if (strcmp(tf_suite_filter[tf_i], name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+#define RUN_SUITE(name)                                                \
+    do {                                                               \
+        if (tf_suite_selected(#name)) {                                \
+            printf("\n%s=== %s ===%s\n", tf_dim(), #name, tf_reset()); \
+            suite_##name();                                            \
+        }                                                              \
     } while (0)
 
 /* ── Summary ───────────────────────────────────────────────────── */

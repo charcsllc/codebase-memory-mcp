@@ -799,7 +799,30 @@ TEST(js_suppress_keeps_specific_and_high_confidence_matches) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* A qualified callee whose single candidate matches the full dotted tail is
+ * receiver-CONFIRMED evidence, not a lucky bare-name hit: Store.findWidgets
+ * against p.m.Store.findWidgets must resolve as qualified_suffix (0.9), not
+ * unique_name (0.75). Mismatched receivers keep the old label. */
+TEST(registry_single_candidate_qualified_tail_upgrades) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "findWidgets", "p.m.Store.findWidgets", "Method");
+    cbm_resolution_t res = cbm_registry_resolve(r, "Store.findWidgets", "p.app", NULL, NULL, 0);
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.qualified_name, "p.m.Store.findWidgets");
+    ASSERT_STR_EQ(res.strategy, "qualified_suffix");
+
+    /* Receiver mismatch: single candidate does NOT get the upgrade. */
+    cbm_registry_add(r, "render", "p.m.Panel.render", "Method");
+    res = cbm_registry_resolve(r, "Other.render", "p.app", NULL, NULL, 0);
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.strategy, "unique_name");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 SUITE(registry) {
+    RUN_TEST(registry_single_candidate_qualified_tail_upgrades);
     /* FQN */
     RUN_TEST(fqn_simple);
     RUN_TEST(fqn_no_name);

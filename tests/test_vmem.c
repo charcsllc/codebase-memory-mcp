@@ -397,6 +397,12 @@ TEST(tier2_alloc_and_free_128) {
     memset(p2, 0xBB, 100);
     cbm_slab_test_free(p2);
 
+    /* Documented precondition of the slab teardown (slab_alloc.h): the
+     * thread's cached TSParsers allocate their internals FROM the slab, so
+     * they must be destroyed first — otherwise the next parse on this
+     * thread reads freed lexer state (ASan: heap-use-after-free in
+     * ts_lexer_goto, armed here and detonating in a LATER test). */
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
@@ -428,6 +434,7 @@ TEST(tier2_alloc_all_classes) {
         cbm_slab_test_free(ptrs[i]);
     }
 
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
@@ -456,6 +463,7 @@ TEST(tier2_free_list_reuse) {
         cbm_slab_test_free(p);
     }
 
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
@@ -482,6 +490,7 @@ TEST(tier2_oversized_dedicated) {
     /* vmem allocated should have decreased (page was freed) */
     ASSERT_LTE(after_free, after_alloc);
 
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
@@ -509,6 +518,7 @@ TEST(tier2_realloc_same_class) {
     ASSERT_EQ(p2, p3); /* same pointer */
 
     cbm_slab_test_free(p3);
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
@@ -540,6 +550,7 @@ TEST(tier2_realloc_grows_class) {
     ASSERT_EQ(bytes[299], 0xFF);
 
     cbm_slab_test_free(p2);
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
@@ -561,6 +572,7 @@ TEST(tier2_realloc_slab_to_tier2) {
     ASSERT_EQ(((unsigned char *)p2)[31], 0x42);
 
     cbm_slab_test_free(p2);
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
@@ -597,6 +609,7 @@ TEST(tier2_calloc_zeroed) {
     ASSERT_EQ(nonzero, 0);
 
     cbm_slab_test_free(p2);
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
@@ -641,6 +654,7 @@ TEST(tier2_mixed_alloc_free_stress) {
         cbm_slab_test_free(ptrs[i]);
     }
 
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }

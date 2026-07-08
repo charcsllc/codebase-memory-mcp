@@ -84,9 +84,24 @@ static void teardown_parallel_repo(void) {
 
 /* ── Run sequential pipeline on files, returning gbuf ─────────────── */
 
+/* Both pipelines anchor DEFINES/IMPORTS edges on each file's File node —
+ * the real pipeline's files pass creates those before definitions run.
+ * The harnesses skip that pass, so seed the File nodes here; without them
+ * the import-edge creator silently produces nothing and import_map
+ * resolution can never engage. */
+static void seed_file_nodes(cbm_gbuf_t *gbuf, const char *project, cbm_file_info_t *files,
+                            int file_count) {
+    for (int i = 0; i < file_count; i++) {
+        char *fq = cbm_pipeline_fqn_compute(project, files[i].rel_path, "__file__");
+        cbm_gbuf_upsert_node(gbuf, "File", files[i].rel_path, fq, files[i].rel_path, 0, 0, "{}");
+        free(fq);
+    }
+}
+
 static cbm_gbuf_t *run_sequential(const char *project, const char *repo_path,
                                   cbm_file_info_t *files, int file_count) {
     cbm_gbuf_t *gbuf = cbm_gbuf_new(project, repo_path);
+    seed_file_nodes(gbuf, project, files, file_count);
     cbm_registry_t *reg = cbm_registry_new();
     atomic_int cancelled;
     atomic_init(&cancelled, 0);
@@ -114,6 +129,7 @@ static cbm_gbuf_t *run_sequential(const char *project, const char *repo_path,
 static cbm_gbuf_t *run_parallel(const char *project, const char *repo_path, cbm_file_info_t *files,
                                 int file_count, int worker_count) {
     cbm_gbuf_t *gbuf = cbm_gbuf_new(project, repo_path);
+    seed_file_nodes(gbuf, project, files, file_count);
     cbm_registry_t *reg = cbm_registry_new();
     atomic_int cancelled;
     atomic_init(&cancelled, 0);
@@ -1259,6 +1275,218 @@ TEST(parallel_inline_route_handler_gets_node_and_handles) {
     PASS();
 }
 
+/* ── Import-map fidelity: dotted basenames + every binding ────────── */
+
+typedef struct {
+    int64_t src_id;
+    int import_map_hits; /* edges from src resolved via import_map */
+    int repo_find_orders;
+    int get_stripe;
+    int stripe_configured;
+    const cbm_gbuf_t *gb;
+} impmap_ctx_t;
+
+static void impmap_scan(const cbm_gbuf_edge_t *e, void *ud) {
+    impmap_ctx_t *c = (impmap_ctx_t *)ud;
+    if (strcmp(e->type, "CALLS") != 0 || e->source_id != c->src_id) {
+        return;
+    }
+    if (!e->properties_json || !strstr(e->properties_json, "\"strategy\":\"import_map\"")) {
+        return;
+    }
+    c->import_map_hits++;
+    const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id((cbm_gbuf_t *)c->gb, e->target_id);
+    if (!t) {
+        return;
+    }
+    if (strstr(t->qualified_name, "svc.b.repository.findOrders")) {
+        c->repo_find_orders++;
+    }
+    if (strstr(t->qualified_name, "other.multi.getStripe")) {
+        c->get_stripe++;
+    }
+    if (strstr(t->qualified_name, "other.multi.stripeConfigured")) {
+        c->stripe_configured++;
+    }
+}
+
+/* A namespace import of a DOTTED basename (import * as repo from
+ * './b.repository') plus two named bindings from one module must all
+ * resolve deterministically via import_map — not decay to unique_name
+ * (fragile: a same-named function elsewhere kills or corrupts it) nor
+ * lose the second binding to the IMPORTS-edge dedup. */
+TEST(parallel_import_map_dotted_and_multibinding) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_impmap_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char d1[512], d2[512];
+    snprintf(d1, sizeof(d1), "%s/svc", tmpdir);
+    snprintf(d2, sizeof(d2), "%s/other", tmpdir);
+    cbm_mkdir(d1);
+    cbm_mkdir(d2);
+
+    char f_repo[512], f_dup[512], f_multi[512], f_svc[512];
+    snprintf(f_repo, sizeof(f_repo), "%s/svc/b.repository.ts", tmpdir);
+    snprintf(f_dup, sizeof(f_dup), "%s/other/dup.ts", tmpdir);
+    snprintf(f_multi, sizeof(f_multi), "%s/other/multi.ts", tmpdir);
+    snprintf(f_svc, sizeof(f_svc), "%s/svc/a.service.ts", tmpdir);
+    FILE *f = fopen(f_repo, "w");
+    fprintf(f, "export function findOrders() { return 1 }\n");
+    fclose(f);
+    f = fopen(f_dup, "w");
+    fprintf(f, "export function findOrders() { return 2 }\n");
+    fclose(f);
+    f = fopen(f_multi, "w");
+    fprintf(f, "export function getStripe() { return 3 }\n"
+               "export function stripeConfigured() { return 4 }\n");
+    fclose(f);
+    f = fopen(f_svc, "w");
+    fprintf(f, "import * as repo from './b.repository'\n"
+               "import { getStripe, stripeConfigured } from '../other/multi'\n"
+               "export function run() {\n"
+               "  repo.findOrders()\n"
+               "  getStripe()\n"
+               "  stripeConfigured()\n"
+               "}\n");
+    fclose(f);
+
+    cbm_file_info_t files[4] = {0};
+    files[0].path = f_repo;
+    files[0].rel_path = (char *)"svc/b.repository.ts";
+    files[0].language = CBM_LANG_TYPESCRIPT;
+    files[1].path = f_dup;
+    files[1].rel_path = (char *)"other/dup.ts";
+    files[1].language = CBM_LANG_TYPESCRIPT;
+    files[2].path = f_multi;
+    files[2].rel_path = (char *)"other/multi.ts";
+    files[2].language = CBM_LANG_TYPESCRIPT;
+    files[3].path = f_svc;
+    files[3].rel_path = (char *)"svc/a.service.ts";
+    files[3].language = CBM_LANG_TYPESCRIPT;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_impmap", tmpdir, files, 4, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_node_t *run_fn = cbm_gbuf_find_by_qn(gbuf, "cbm_par_impmap.svc.a.service.run");
+    ASSERT_NOT_NULL(run_fn);
+
+    impmap_ctx_t c = {0};
+    c.src_id = run_fn->id;
+    c.gb = gbuf;
+    cbm_gbuf_foreach_edge(gbuf, impmap_scan, &c);
+    ASSERT_EQ(c.repo_find_orders, 1);
+    ASSERT_EQ(c.get_stripe, 1);
+    ASSERT_EQ(c.stripe_configured, 1);
+
+    cbm_gbuf_free(gbuf);
+    unlink(f_repo);
+    unlink(f_dup);
+    unlink(f_multi);
+    unlink(f_svc);
+    rmdir(d1);
+    rmdir(d2);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* ── PHP: `use` imports must beat same-name distractors ───────────── */
+
+typedef struct {
+    const cbm_gbuf_t *gb;
+    int to_store;
+    int to_store_strong;
+    int to_dup;
+} php_use_ctx_t;
+
+static void php_use_scan(const cbm_gbuf_edge_t *e, void *ud) {
+    php_use_ctx_t *c = (php_use_ctx_t *)ud;
+    if (strcmp(e->type, "CALLS") != 0 || !e->properties_json ||
+        !strstr(e->properties_json, "findWidgets")) {
+        return;
+    }
+    const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id((cbm_gbuf_t *)c->gb, e->target_id);
+    if (!t) {
+        return;
+    }
+    if (strstr(t->qualified_name, "Store.Store.findWidgets")) {
+        c->to_store++;
+        /* Deterministic evidence, not a distance tie-break that happens to
+         * land right: import-confirmed or receiver-confirmed only. */
+        if (strstr(e->properties_json, "\"strategy\":\"import_map") ||
+            strstr(e->properties_json, "\"strategy\":\"qualified_suffix\"")) {
+            c->to_store_strong++;
+        }
+    }
+    if (strstr(t->qualified_name, "Dup")) {
+        c->to_dup++;
+    }
+}
+
+/* Namespace-import map values were File-node QNs ("...src.Store.__file__"),
+ * so the import_map candidate never matched a real symbol and PHP member
+ * calls decayed to suffix matching — where a same-named class in another
+ * namespace WON (Store::findWidgets resolved to Dup::findWidgets in the
+ * language bench). */
+TEST(sequential_php_use_import_beats_distractor) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_php_use_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char dsrc[512];
+    snprintf(dsrc, sizeof(dsrc), "%s/src", tmpdir);
+    cbm_mkdir(dsrc);
+    char f_store[512], f_dup[512], f_idx[512];
+    snprintf(f_store, sizeof(f_store), "%s/src/Store.php", tmpdir);
+    snprintf(f_dup, sizeof(f_dup), "%s/src/Dup.php", tmpdir);
+    snprintf(f_idx, sizeof(f_idx), "%s/index.php", tmpdir);
+    FILE *f = fopen(f_store, "w");
+    fprintf(f, "<?php\nnamespace App\\Store;\n\nclass Store {\n"
+               "    public static function findWidgets() { return 1; }\n"
+               "    public static function renderPanel() { return 2; }\n}\n");
+    fclose(f);
+    f = fopen(f_dup, "w");
+    fprintf(f, "<?php\nnamespace App\\Dup;\n\nclass Dup {\n"
+               "    public static function findWidgets() { return 9; }\n}\n");
+    fclose(f);
+    f = fopen(f_idx, "w");
+    fprintf(f, "<?php\nuse App\\Store\\Store;\n\nfunction run() {\n"
+               "    return Store::findWidgets() + Store::renderPanel();\n}\n");
+    fclose(f);
+
+    cbm_file_info_t files[3] = {0};
+    files[0].path = f_store;
+    files[0].rel_path = (char *)"src/Store.php";
+    files[0].language = CBM_LANG_PHP;
+    files[1].path = f_dup;
+    files[1].rel_path = (char *)"src/Dup.php";
+    files[1].language = CBM_LANG_PHP;
+    files[2].path = f_idx;
+    files[2].rel_path = (char *)"index.php";
+    files[2].language = CBM_LANG_PHP;
+
+    cbm_gbuf_t *gbuf = run_sequential("cbm_php_use", tmpdir, files, 3);
+    ASSERT_NOT_NULL(gbuf);
+
+    /* findWidgets must land on Store's method — never on Dup's. */
+    php_use_ctx_t pc = {0};
+    pc.gb = gbuf;
+    cbm_gbuf_foreach_edge(gbuf, php_use_scan, &pc);
+    ASSERT_GTE(pc.to_store, 1);
+    ASSERT_GTE(pc.to_store_strong, 1);
+    ASSERT_EQ(pc.to_dup, 0);
+
+    cbm_gbuf_free(gbuf);
+    unlink(f_store);
+    unlink(f_dup);
+    unlink(f_idx);
+    rmdir(dsrc);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
@@ -1296,6 +1524,8 @@ SUITE(parallel) {
     RUN_TEST(sequential_url_and_fetch_detection_parity);
     RUN_TEST(parallel_template_url_gets_method_route);
     RUN_TEST(parallel_inline_route_handler_gets_node_and_handles);
+    RUN_TEST(parallel_import_map_dotted_and_multibinding);
+    RUN_TEST(sequential_php_use_import_beats_distractor);
 
     /* Cleanup shared state */
     parity_teardown();

@@ -100,6 +100,10 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
 /* Module QN: project.dir.parts (no name). Caller must free(). */
 char *cbm_pipeline_fqn_module(const char *project, const char *rel_path);
 
+/* Variant for already-extensionless (resolved import) paths: skips the
+ * extension strip so dotted basenames survive intact. */
+char *cbm_pipeline_fqn_module_noext(const char *project, const char *rel_path);
+
 /* Folder QN: project.dir.parts. Caller must free(). */
 char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir);
 

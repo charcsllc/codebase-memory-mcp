@@ -192,6 +192,37 @@ TEST(extract_ts_template_url_first_string_arg) {
     PASS();
 }
 
+/* --- Scala: package + import extraction --- */
+/* Scala files declare `package com.example.store` and import members with
+ * `import com.example.store.Store` — without capturing both, the namespace
+ * map has no entry for the file and every Store.method() call decays to
+ * penalized suffix matching (0 IMPORTS edges in the language bench). */
+TEST(extract_scala_package_and_imports) {
+    CBMFileResult *r = extract("package com.example.app\n"
+                               "\n"
+                               "import com.example.store.Store\n"
+                               "\n"
+                               "object Main {\n"
+                               "  def run(): Int = Store.findWidgets()\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Main.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(r->namespace_name);
+    ASSERT_STR_EQ(r->namespace_name, "com.example.app");
+    int found = 0;
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *im = &r->imports.items[i];
+        if (im->module_path && strcmp(im->module_path, "com.example.store.Store") == 0 &&
+            im->local_name && strcmp(im->local_name, "Store") == 0) {
+            found = 1;
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Prisma: models labeled Model; generator/datasource are not defs --- */
 TEST(extract_prisma_model_labels) {
     CBMFileResult *r = extract("generator client {\n"
@@ -3154,6 +3185,7 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_await_generic_call_controls);
     RUN_TEST(extract_prisma_model_labels);
     RUN_TEST(extract_ts_template_url_first_string_arg);
+    RUN_TEST(extract_scala_package_and_imports);
     RUN_TEST(extract_c_macros_issue375);
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_gdscript_issue186);

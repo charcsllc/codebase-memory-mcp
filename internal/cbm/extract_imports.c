@@ -960,6 +960,65 @@ static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
     ts_tree_cursor_delete(&cursor);
 }
 
+// --- Scala imports ---
+// import_declaration -> stable_identifier ("com.example.store.Store"), with
+// optional selector group: `import a.b.{C, D}` (namespace_selectors) and
+// wildcard `import a.b._`. The generic field extractor grabbed only the
+// FIRST identifier segment ("com"), poisoning the resolver map with a
+// useless key — every Store.method() call then decayed to penalized
+// suffix matching (language bench: 0 usable IMPORTS for Scala).
+static void parse_scala_imports(CBMExtractCtx *ctx) {
+    CBMArena *a = ctx->arena;
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(node), "import_declaration") != 0) {
+            continue;
+        }
+        /* The vendored grammar flattens the dotted path into SIBLING
+         * identifier children (com, example, store, Store) — join them.
+         * Newer grammar versions wrap it in a stable_identifier; accept
+         * both. A namespace_selectors child turns each selector into its
+         * own binding under the joined prefix. */
+        char *prefix = NULL;
+        bool pushed_selector = false;
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode ch = ts_node_named_child(node, i);
+            const char *ck = ts_node_type(ch);
+            if (strcmp(ck, "stable_identifier") == 0) {
+                prefix = cbm_node_text(a, ch, ctx->source);
+            } else if (strcmp(ck, "identifier") == 0) {
+                char *seg = cbm_node_text(a, ch, ctx->source);
+                if (seg && seg[0]) {
+                    prefix = prefix ? cbm_arena_sprintf(a, "%s.%s", prefix, seg) : seg;
+                }
+            } else if (strcmp(ck, "namespace_selectors") == 0 && prefix && prefix[0]) {
+                uint32_t sc = ts_node_named_child_count(ch);
+                for (uint32_t j = 0; j < sc; j++) {
+                    char *sel = cbm_node_text(a, ts_node_named_child(ch, j), ctx->source);
+                    if (sel && sel[0] && strcmp(sel, "_") != 0) {
+                        CBMImport imp = {.local_name = sel,
+                                         .module_path =
+                                             cbm_arena_sprintf(a, "%s.%s", prefix, sel)};
+                        cbm_imports_push(&ctx->result->imports, a, imp);
+                        pushed_selector = true;
+                    }
+                }
+            }
+        }
+        if (!pushed_selector && prefix && prefix[0]) {
+            CBMImport imp = {.local_name = (char *)path_last(a, prefix), .module_path = prefix};
+            cbm_imports_push(&ctx->result->imports, a, imp);
+        }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
 // --- Kotlin imports ---
 // tree-sitter-kotlin nests imports: source_file -> import_list -> import_header*.
 // parse_generic_imports only scans the DIRECT children of root, and "import" is
@@ -1477,6 +1536,7 @@ static void capture_namespace_decl(CBMExtractCtx *ctx) {
                                      "package_declaration",               // Java / Kotlin
                                      "package_header",                    // Kotlin
                                      "namespace_definition",              // PHP
+                                     "package_clause",                    // Scala
                                      NULL};
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
@@ -1494,6 +1554,7 @@ static void capture_namespace_decl(CBMExtractCtx *ctx) {
         static const char *name_kinds[] = {"qualified_name",
                                            "scoped_identifier",
                                            "namespace_name",
+                                           "package_identifier", // Scala
                                            "identifier",
                                            "dotted_name",
                                            "name",
@@ -2738,6 +2799,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_KOTLIN:
     case CBM_LANG_CSHARP:
     case CBM_LANG_PHP:
+    case CBM_LANG_SCALA:
         capture_namespace_decl(ctx);
         break;
     default:
@@ -2762,7 +2824,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_kotlin_imports(ctx);
         break;
     case CBM_LANG_SCALA:
-        parse_generic_imports(ctx, "import_declaration");
+        parse_scala_imports(ctx);
         break;
     case CBM_LANG_CSHARP:
         parse_csharp_imports(ctx);

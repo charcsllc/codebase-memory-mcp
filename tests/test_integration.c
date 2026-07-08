@@ -291,9 +291,8 @@ TEST(integ_mcp_search_graph_by_label) {
 
     char *resp = call_tool("search_graph", args);
     ASSERT_NOT_NULL(resp);
-    /* Should return function nodes */
-    ASSERT_NOT_NULL(strstr(resp, "Function"));
-    /* Should contain our known functions */
+    /* Label is elided per-row when the query filtered by it (the caller
+     * already knows); the rows themselves prove the filter worked. */
     ASSERT_NOT_NULL(strstr(resp, "greet"));
     free(resp);
     PASS();

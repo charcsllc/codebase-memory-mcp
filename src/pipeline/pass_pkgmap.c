@@ -1116,10 +1116,12 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
         return cbm_pipeline_fqn_module(ctx ? ctx->project_name : NULL, module_path);
     }
 
-    /* 1. Try relative import resolution (existing logic) */
+    /* 1. Try relative import resolution (existing logic). The resolver
+     * already normalized the extension (JS whitelist) — do NOT re-strip,
+     * or dotted basenames ('./b.repository') lose their last segment. */
     char *resolved = cbm_pipeline_resolve_relative_import(source_rel, module_path);
     if (resolved) {
-        char *qn = cbm_pipeline_fqn_module(ctx->project_name, resolved);
+        char *qn = cbm_pipeline_fqn_module_noext(ctx->project_name, resolved);
         free(resolved);
         return qn;
     }
@@ -1338,6 +1340,44 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     return found;
 }
 
+/* True for a JS-style relative import ('./x', '../y/z') whose basename
+ * still contains a dot after extension stripping — the only case where the
+ * resolved QN may carry a spurious trailing segment (unknown extension). */
+static bool js_relative_dotted_basename(const char *module_path) {
+    if (!module_path || module_path[0] != '.') {
+        return false;
+    }
+    if (!(module_path[1] == '/' || (module_path[1] == '.' && module_path[2] == '/'))) {
+        return false;
+    }
+    const char *base = strrchr(module_path, '/');
+    base = base ? base + 1 : module_path;
+    return strchr(base, '.') != NULL;
+}
+
+/* Resolve an import's module path to its in-graph module node: exact QN
+ * first; for JS relative imports with a dotted basename, retry without the
+ * trailing dot-segment (module QNs strip the real file extension, so
+ * './data.yaml' needs the retry while './b.repository' hits exactly). */
+static const cbm_gbuf_node_t *module_node_for_import(const cbm_pipeline_ctx_t *ctx,
+                                                     const char *source_rel,
+                                                     const char *module_path) {
+    char *target_qn = cbm_pipeline_resolve_module(ctx, source_rel, module_path);
+    if (!target_qn) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+    if (!target && js_relative_dotted_basename(module_path)) {
+        char *dot = strrchr(target_qn, '.');
+        if (dot && dot != target_qn) {
+            *dot = '\0';
+            target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+        }
+    }
+    free(target_qn);
+    return target;
+}
+
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
@@ -1348,9 +1388,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     }
 
     /* Strategy 1: module-path resolution → existing node (Python/TS/Go). */
-    char *target_qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
-    const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
-    free(target_qn);
+    const cbm_gbuf_node_t *target = module_node_for_import(ctx, source_rel, imp->module_path);
     if (target) {
         return target;
     }
@@ -1663,4 +1701,255 @@ void cbm_pipeline_namespace_map_free(CBMHashTable *map) {
     }
     cbm_ht_foreach(map, ns_map_free_entry, NULL);
     cbm_ht_free(map);
+}
+
+/* ── Shared per-file import machinery ─────────────────────────────
+ *
+ * Both pipelines need the same two views of a file's imports:
+ *   1. the resolver map (local_name → module QN), one entry PER BINDING —
+ *      `import * as repo from './m'` and `import {a, b} from './m'` are
+ *      three bindings;
+ *   2. the IMPORTS edges (File → module node). The graph buffer dedupes
+ *      edges by (source, target, type), so multiple bindings from one
+ *      module collapse into ONE edge that must carry every local name —
+ *      previously only the first survived and the rest silently fell out
+ *      of the resolver map, degrading their calls to unique_name.
+ * Keeping both here (next to cbm_pipeline_resolve_import_node) replaces
+ * the two hand-kept-in-sync copies in pass_definitions.c/pass_calls.c. */
+
+/* Resolver-map value: the target's MODULE QN, owned by the map. Namespace
+ * imports resolve to FILE nodes whose QN carries a ".__file__" tail — a
+ * candidate composed from it ("...Store.__file__.findWidgets") can never
+ * match a symbol QN, which silently disabled import_map for every
+ * namespace language (PHP/Java/C#/Scala) and let same-name distractors
+ * win on suffix scoring. */
+static const char *owned_module_qn(const char *qn) {
+    static const char suffix[] = ".__file__";
+    size_t ql = strlen(qn);
+    size_t sl = sizeof(suffix) - 1;
+    if (ql > sl && strcmp(qn + ql - sl, suffix) == 0) {
+        return cbm_strndup(qn, ql - sl);
+    }
+    return strdup(qn);
+}
+
+int cbm_pipeline_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *rel_path,
+                                  const CBMFileResult *result, CBMHashTable *namespace_map,
+                                  const char ***out_keys, const char ***out_vals,
+                                  int *out_count) {
+    *out_keys = NULL;
+    *out_vals = NULL;
+    *out_count = 0;
+    if (!ctx || !result || result->imports.count <= 0) {
+        return 0;
+    }
+    const char **keys = calloc((size_t)result->imports.count, sizeof(const char *));
+    const char **vals = calloc((size_t)result->imports.count, sizeof(const char *));
+    if (!keys || !vals) {
+        free(keys);
+        free(vals);
+        return 0;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
+    int count = 0;
+    for (int i = 0; i < result->imports.count; i++) {
+        const CBMImport *imp = &result->imports.items[i];
+        if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
+            continue;
+        }
+        /* Full import-target stack (module path → namespace map → symbol
+         * fallback): non-relative namespace imports (PHP use App\X\Y,
+         * Scala/Java import com.example.Store) only resolve through the
+         * namespace map, which the plain module-path resolver can't see. */
+        const cbm_gbuf_node_t *target =
+            cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, imp, namespace_map);
+        if (!target) {
+            continue;
+        }
+        keys[count] = strdup(imp->local_name);
+        vals[count] = owned_module_qn(target->qualified_name);
+        count++;
+    }
+    free(file_qn);
+    *out_keys = keys;
+    *out_vals = vals;
+    *out_count = count;
+    return 0;
+}
+
+void cbm_pipeline_free_import_map(const char **keys, const char **vals, int count) {
+    for (int i = 0; i < count; i++) {
+        if (keys) {
+            free((void *)keys[i]);
+        }
+        if (vals) {
+            free((void *)vals[i]);
+        }
+    }
+    free((void *)keys);
+    free((void *)vals);
+}
+
+/* One IMPORTS edge per imported MODULE, its properties carrying every
+ * local binding name (JSON-escaped, comma-joined): the edge-dedup key is
+ * (source, target, type), so per-binding inserts would silently drop all
+ * but the first binding's local_name. */
+int cbm_pipeline_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                     const char *rel, CBMHashTable *namespace_map) {
+    enum { IMP_NAMES_CAP = 4096 };
+    if (!ctx || !result || result->imports.count <= 0) {
+        return 0;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+    const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+    free(file_qn);
+    if (!source_node) {
+        return 0;
+    }
+    int n = result->imports.count;
+    int64_t *tgt_ids = calloc((size_t)n, sizeof(int64_t));
+    char **joined = calloc((size_t)n, sizeof(char *));
+    if (!tgt_ids || !joined) {
+        free(tgt_ids);
+        free(joined);
+        return 0;
+    }
+    int groups = 0;
+    char *fq = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+    for (int j = 0; j < n; j++) {
+        const CBMImport *imp = &result->imports.items[j];
+        if (!imp->module_path) {
+            continue;
+        }
+        const cbm_gbuf_node_t *target =
+            cbm_pipeline_resolve_import_node(ctx, rel, fq, imp, namespace_map);
+        if (!target || target->id == source_node->id) {
+            continue;
+        }
+        int g = 0;
+        while (g < groups && tgt_ids[g] != target->id) {
+            g++;
+        }
+        if (g == groups) {
+            tgt_ids[groups] = target->id;
+            joined[groups] = calloc(1, IMP_NAMES_CAP);
+            if (!joined[groups]) {
+                break;
+            }
+            groups++;
+        }
+        const char *ln = imp->local_name ? imp->local_name : "";
+        if (ln[0] && joined[g]) {
+            size_t cur = strlen(joined[g]);
+            size_t lnl = strlen(ln);
+            if (cur + lnl + 2 < IMP_NAMES_CAP) {
+                if (cur > 0) {
+                    joined[g][cur++] = ',';
+                }
+                memcpy(joined[g] + cur, ln, lnl + 1);
+            }
+        }
+    }
+    free(fq);
+    int count = 0;
+    for (int g = 0; g < groups; g++) {
+        char esc_ln[CBM_SZ_512];
+        cbm_json_escape(esc_ln, sizeof(esc_ln), joined[g] ? joined[g] : "");
+        char imp_props[CBM_SZ_1K];
+        snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
+        cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, tgt_ids[g], "IMPORTS", imp_props);
+        count++;
+        free(joined[g]);
+    }
+    free(tgt_ids);
+    free(joined);
+    return count;
+}
+
+/* Edge-based variant for contexts without a pipeline ctx (the parallel
+ * resolve workers read the merged gbuf read-only; the IMPORTS edges were
+ * created with full namespace/alias resolution during merge). Splits the
+ * comma-joined local_name list back into one map entry per binding. */
+int cbm_pipeline_import_map_from_edges(const cbm_gbuf_t *gbuf, const char *project_name,
+                                       const char *rel_path, const char ***out_keys,
+                                       const char ***out_vals, int *out_count) {
+    *out_keys = NULL;
+    *out_vals = NULL;
+    *out_count = 0;
+    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
+    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(gbuf, file_qn);
+    free(file_qn);
+    if (!file_node) {
+        return 0;
+    }
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    int rc = cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges,
+                                                &edge_count);
+    if (rc != 0 || edge_count == 0) {
+        return 0;
+    }
+    /* Pass 1: total bindings across all edges (commas + 1 per list). */
+    int total = 0;
+    for (int i = 0; i < edge_count; i++) {
+        const char *start =
+            edges[i]->properties_json ? strstr(edges[i]->properties_json, "\"local_name\":\"")
+                                      : NULL;
+        if (!start) {
+            continue;
+        }
+        start += strlen("\"local_name\":\"");
+        const char *end = strchr(start, '"');
+        if (!end || end <= start) {
+            continue;
+        }
+        total++;
+        for (const char *c = start; c < end; c++) {
+            if (*c == ',') {
+                total++;
+            }
+        }
+    }
+    if (total == 0) {
+        return 0;
+    }
+    const char **keys = calloc((size_t)total, sizeof(const char *));
+    const char **vals = calloc((size_t)total, sizeof(const char *));
+    if (!keys || !vals) {
+        free(keys);
+        free(vals);
+        return 0;
+    }
+    int count = 0;
+    for (int i = 0; i < edge_count; i++) {
+        const cbm_gbuf_edge_t *e = edges[i];
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id((cbm_gbuf_t *)gbuf, e->target_id);
+        if (!target || !e->properties_json) {
+            continue;
+        }
+        const char *start = strstr(e->properties_json, "\"local_name\":\"");
+        if (!start) {
+            continue;
+        }
+        start += strlen("\"local_name\":\"");
+        const char *end = strchr(start, '"');
+        if (!end || end <= start) {
+            continue;
+        }
+        const char *tok = start;
+        while (tok < end && count < total) {
+            const char *comma = memchr(tok, ',', (size_t)(end - tok));
+            const char *tok_end = comma ? comma : end;
+            if (tok_end > tok) {
+                keys[count] = cbm_strndup(tok, (size_t)(tok_end - tok));
+                vals[count] = owned_module_qn(target->qualified_name);
+                count++;
+            }
+            tok = tok_end + 1;
+        }
+    }
+    *out_keys = keys;
+    *out_vals = vals;
+    *out_count = count;
+    return 0;
 }

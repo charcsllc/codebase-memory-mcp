@@ -288,11 +288,17 @@ static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *so
         }
     }
 
-    // Try "name" field (Java method_invocation)
+    // Try "name" field (Java method_invocation; PHP scoped/member calls)
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     if (!ts_node_is_null(name_node)) {
         char *name = cbm_node_text(a, name_node, source);
         TSNode obj = ts_node_child_by_field_name(node, TS_FIELD("object"));
+        if (ts_node_is_null(obj)) {
+            // PHP static/namespace calls (Store::findWidgets): the receiver
+            // lives in the `scope` field. Without it the callee degrades to
+            // a bare name and same-name distractors win on suffix scoring.
+            obj = ts_node_child_by_field_name(node, TS_FIELD("scope"));
+        }
         if (!ts_node_is_null(obj) && name) {
             char *obj_text = cbm_node_text(a, obj, source);
             if (obj_text && obj_text[0]) {
