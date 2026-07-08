@@ -377,6 +377,12 @@ TEST(slab_tier1_malloc_backed) {
     memset(p2, 0x43, 32);
     cbm_slab_test_free(p2);
 
+    /* Documented precondition of the slab teardown (slab_alloc.h): the
+     * thread's cached TSParsers allocate their internals FROM the slab, so
+     * they must be destroyed first — otherwise the next parse on this
+     * thread reads freed lexer state (ASan: heap-use-after-free in
+     * ts_lexer_goto, armed here and detonating in a LATER test). */
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
@@ -410,6 +416,7 @@ TEST(slab_heap_alloc_and_free) {
         cbm_slab_test_free(ptrs[i]);
     }
 
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
@@ -438,6 +445,7 @@ TEST(slab_reclaim_returns_memory) {
     ASSERT_NOT_NULL(p);
     cbm_slab_test_free(p);
 
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
@@ -456,6 +464,7 @@ TEST(slab_realloc_slab_to_heap) {
     ASSERT_EQ(((unsigned char *)p2)[31], 0x42);
 
     cbm_slab_test_free(p2);
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
@@ -476,6 +485,7 @@ TEST(slab_calloc_zeroed) {
     ASSERT_EQ(nonzero, 0);
 
     cbm_slab_test_free(p);
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
@@ -517,6 +527,7 @@ TEST(slab_mixed_alloc_free_stress) {
         cbm_slab_test_free(ptrs[i]);
     }
 
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     PASS();
 }
