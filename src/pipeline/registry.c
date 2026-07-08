@@ -783,10 +783,13 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         return empty_result(); /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
     }
 
-    /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
+    /* Strategy 3.5: a qualified callee disambiguates among same-name
      * candidates by full qualified tail, before bare-name scoring collapses
-     * them onto a single winner. */
-    if (arr->count > 1) {
+     * them onto a single winner. Also runs for a SINGLE candidate: a
+     * receiver-confirmed tail (Store.findWidgets → p.m.Store.findWidgets)
+     * is stronger evidence than bare-name uniqueness, and a mismatched
+     * receiver correctly stays on the weaker unique_name path. */
+    {
         const char *q = qualified_suffix_match(arr, callee_name);
         if (q) {
             return (cbm_resolution_t){q, "qualified_suffix", CONF_QUALIFIED_SUFFIX, REG_RESOLVED};
