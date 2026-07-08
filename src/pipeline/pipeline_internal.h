@@ -99,11 +99,13 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
                                   const char *module_path);
 
 /* Per-file (local_name → module QN) resolver map, one entry per import
- * binding. Values are borrowed from the graph buffer; free with
+ * binding. Keys and values are owned by the map (values are module QNs,
+ * with any ".__file__" tail stripped); free with
  * cbm_pipeline_free_import_map. */
 int cbm_pipeline_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *rel_path,
-                                  const CBMFileResult *result, const char ***out_keys,
-                                  const char ***out_vals, int *out_count);
+                                  const CBMFileResult *result, CBMHashTable *namespace_map,
+                                  const char ***out_keys, const char ***out_vals,
+                                  int *out_count);
 void cbm_pipeline_free_import_map(const char **keys, const char **vals, int count);
 
 /* Edge-based variant (no ctx needed): rebuilds the map from a file's

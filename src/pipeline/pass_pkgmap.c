@@ -1717,9 +1717,26 @@ void cbm_pipeline_namespace_map_free(CBMHashTable *map) {
  * Keeping both here (next to cbm_pipeline_resolve_import_node) replaces
  * the two hand-kept-in-sync copies in pass_definitions.c/pass_calls.c. */
 
+/* Resolver-map value: the target's MODULE QN, owned by the map. Namespace
+ * imports resolve to FILE nodes whose QN carries a ".__file__" tail — a
+ * candidate composed from it ("...Store.__file__.findWidgets") can never
+ * match a symbol QN, which silently disabled import_map for every
+ * namespace language (PHP/Java/C#/Scala) and let same-name distractors
+ * win on suffix scoring. */
+static const char *owned_module_qn(const char *qn) {
+    static const char suffix[] = ".__file__";
+    size_t ql = strlen(qn);
+    size_t sl = sizeof(suffix) - 1;
+    if (ql > sl && strcmp(qn + ql - sl, suffix) == 0) {
+        return cbm_strndup(qn, ql - sl);
+    }
+    return strdup(qn);
+}
+
 int cbm_pipeline_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *rel_path,
-                                  const CBMFileResult *result, const char ***out_keys,
-                                  const char ***out_vals, int *out_count) {
+                                  const CBMFileResult *result, CBMHashTable *namespace_map,
+                                  const char ***out_keys, const char ***out_vals,
+                                  int *out_count) {
     *out_keys = NULL;
     *out_vals = NULL;
     *out_count = 0;
@@ -1733,20 +1750,27 @@ int cbm_pipeline_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *rel
         free(vals);
         return 0;
     }
+    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
     int count = 0;
     for (int i = 0; i < result->imports.count; i++) {
         const CBMImport *imp = &result->imports.items[i];
         if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
             continue;
         }
-        const cbm_gbuf_node_t *target = module_node_for_import(ctx, rel_path, imp->module_path);
+        /* Full import-target stack (module path → namespace map → symbol
+         * fallback): non-relative namespace imports (PHP use App\X\Y,
+         * Scala/Java import com.example.Store) only resolve through the
+         * namespace map, which the plain module-path resolver can't see. */
+        const cbm_gbuf_node_t *target =
+            cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, imp, namespace_map);
         if (!target) {
             continue;
         }
         keys[count] = strdup(imp->local_name);
-        vals[count] = target->qualified_name; /* borrowed from gbuf */
+        vals[count] = owned_module_qn(target->qualified_name);
         count++;
     }
+    free(file_qn);
     *out_keys = keys;
     *out_vals = vals;
     *out_count = count;
@@ -1754,12 +1778,15 @@ int cbm_pipeline_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *rel
 }
 
 void cbm_pipeline_free_import_map(const char **keys, const char **vals, int count) {
-    if (keys) {
-        for (int i = 0; i < count; i++) {
+    for (int i = 0; i < count; i++) {
+        if (keys) {
             free((void *)keys[i]);
         }
-        free((void *)keys);
+        if (vals) {
+            free((void *)vals[i]);
+        }
     }
+    free((void *)keys);
     free((void *)vals);
 }
 
@@ -1915,7 +1942,7 @@ int cbm_pipeline_import_map_from_edges(const cbm_gbuf_t *gbuf, const char *proje
             const char *tok_end = comma ? comma : end;
             if (tok_end > tok) {
                 keys[count] = cbm_strndup(tok, (size_t)(tok_end - tok));
-                vals[count] = target->qualified_name;
+                vals[count] = owned_module_qn(target->qualified_name);
                 count++;
             }
             tok = tok_end + 1;

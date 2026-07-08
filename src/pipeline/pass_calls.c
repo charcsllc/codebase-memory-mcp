@@ -79,14 +79,36 @@ static const char *itoa_log(int val) {
  * resolution via cbm_pipeline_resolve_module) with the IMPORTS-edge scan as
  * fallback when no extraction result is cached. */
 static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
-                            const CBMFileResult *result, const char ***out_keys,
-                            const char ***out_vals, int *out_count) {
+                            const CBMFileResult *result, CBMHashTable *namespace_map,
+                            const char ***out_keys, const char ***out_vals, int *out_count) {
     if (result && result->imports.count > 0) {
-        return cbm_pipeline_build_import_map(ctx, rel_path, result, out_keys, out_vals,
-                                             out_count);
+        return cbm_pipeline_build_import_map(ctx, rel_path, result, namespace_map, out_keys,
+                                             out_vals, out_count);
     }
     return cbm_pipeline_import_map_from_edges(ctx->gbuf, ctx->project_name, rel_path, out_keys,
                                               out_vals, out_count);
+}
+
+/* Build the namespace → declaring-file map from the extraction cache, so
+ * per-file import maps resolve namespace imports exactly like the
+ * definitions pass did when it created the IMPORTS edges. NULL when no
+ * cache (test harnesses) — the builder then skips namespace resolution. */
+static CBMHashTable *calls_namespace_map(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                         int file_count) {
+    if (!ctx->result_cache) {
+        return NULL;
+    }
+    const char **rels = calloc((size_t)file_count, sizeof(const char *));
+    if (!rels) {
+        return NULL;
+    }
+    for (int i = 0; i < file_count; i++) {
+        rels[i] = files[i].rel_path;
+    }
+    CBMHashTable *map = cbm_pipeline_namespace_map_build(ctx->project_name, ctx->result_cache,
+                                                         (const char *const *)rels, file_count);
+    free(rels);
+    return map;
 }
 
 /* Handle a route registration call: create Route node + HANDLES edge. */
@@ -372,6 +394,7 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
 int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count) {
     cbm_log_info("pass.start", "pass", "calls", "files", itoa_log(file_count));
 
+    CBMHashTable *ns_map = calls_namespace_map(ctx, files, file_count);
     int total_calls = 0;
     int resolved = 0;
     int unresolved = 0;
@@ -379,6 +402,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
+            cbm_pipeline_namespace_map_free(ns_map);
             return CBM_NOT_FOUND;
         }
 
@@ -401,7 +425,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        build_import_map(ctx, rel, result, ns_map, &imp_keys, &imp_vals, &imp_count);
 
         /* Compute module QN for same-module resolution */
         char *module_qn = cbm_pipeline_fqn_module(ctx->project_name, rel);
@@ -428,6 +452,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         }
     }
 
+    cbm_pipeline_namespace_map_free(ns_map);
     cbm_log_info("pass.done", "pass", "calls", "total", itoa_log(total_calls), "resolved",
                  itoa_log(resolved), "unresolved", itoa_log(unresolved), "errors",
                  itoa_log(errors));
@@ -556,7 +581,7 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, files[i].rel_path, result, &imp_keys, &imp_vals, &imp_count);
+        build_import_map(ctx, files[i].rel_path, result, NULL, &imp_keys, &imp_vals, &imp_count);
 
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
